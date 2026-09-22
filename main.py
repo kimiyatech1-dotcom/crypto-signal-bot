@@ -6,14 +6,12 @@ import time
 import os
 from datetime import datetime
 
-# ==================== CONFIG ====================
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 CHAT_ID = os.environ.get("CHAT_ID")
 
-SCAN_INTERVAL = 900          # 15 minutes
+SCAN_INTERVAL = 900
 TOP_N = 30
 
-# ==================== TELEGRAM ====================
 def send_telegram(message):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {
@@ -26,7 +24,6 @@ def send_telegram(message):
     except Exception as e:
         print("Telegram error:", e)
 
-# ==================== FEAR & GREED ====================
 def get_fear_greed():
     try:
         r = requests.get("https://api.alternative.me/fng/", timeout=10)
@@ -35,7 +32,6 @@ def get_fear_greed():
     except:
         return None, "Unknown"
 
-# ==================== TECHNICAL + SCORE ====================
 def get_technical_score(df):
     if len(df) < 50:
         return 0, []
@@ -61,7 +57,6 @@ def get_technical_score(df):
     score = 0
     reasons = []
 
-    # RSI
     if last['rsi'] < 30:
         score += 2
         reasons.append("RSI Oversold")
@@ -75,7 +70,6 @@ def get_technical_score(df):
         score -= 1
         reasons.append("RSI High")
 
-    # MACD
     if last['MACD_12_26_9'] > last['MACDs_12_26_9'] and prev['MACD_12_26_9'] <= prev['MACDs_12_26_9']:
         score += 2
         reasons.append("MACD Bullish Cross")
@@ -83,7 +77,6 @@ def get_technical_score(df):
         score -= 2
         reasons.append("MACD Bearish Cross")
 
-    # EMA Cross
     if last['ema9'] > last['ema21'] and prev['ema9'] <= prev['ema21']:
         score += 2
         reasons.append("EMA Bullish Cross")
@@ -91,7 +84,6 @@ def get_technical_score(df):
         score -= 2
         reasons.append("EMA Bearish Cross")
 
-    # Bollinger
     if last['close'] < last['BBL_20_2.0']:
         score += 1
         reasons.append("Below Lower BB")
@@ -99,7 +91,6 @@ def get_technical_score(df):
         score -= 1
         reasons.append("Above Upper BB")
 
-    # Stoch RSI
     if last['STOCHRSIk_14_14_3_3'] < 20:
         score += 1
         reasons.append("StochRSI Oversold")
@@ -107,7 +98,6 @@ def get_technical_score(df):
         score -= 1
         reasons.append("StochRSI Overbought")
 
-    # Volume
     if last['volume'] > last['vol_ma'] * 1.8:
         if score > 0:
             score += 1
@@ -117,13 +107,12 @@ def get_technical_score(df):
 
     return score, reasons
 
-# ==================== BTC MARKET TREND ====================
 def get_btc_trend(exchange):
     try:
         score_1h = 0
         score_4h = 0
 
-        for tf, target in [('1h', 'score_1h'), ('4h', 'score_4h')]:
+        for tf in ['1h', '4h']:
             ohlcv = exchange.fetch_ohlcv('BTC/USDT', timeframe=tf, limit=50)
             df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
             score, _ = get_technical_score(df)
@@ -132,7 +121,6 @@ def get_btc_trend(exchange):
             else:
                 score_4h = score
 
-        # Average market bias
         market_score = (score_1h + score_4h) / 2
 
         if market_score >= 2:
@@ -144,17 +132,14 @@ def get_btc_trend(exchange):
     except:
         return "Neutral", 0
 
-# ==================== MAIN ANALYSIS ====================
 def analyze_coin(df, timeframe, market_trend, market_score, fg_value, fg_text):
     tech_score, reasons = get_technical_score(df)
 
     if tech_score == 0:
         return None
 
-    # Market Filter
     final_score = tech_score
 
-    # Agar market strongly opposite hai to score weaken kar do
     if tech_score > 0 and market_trend == "Bearish":
         final_score -= 1
         reasons.append("Market is Bearish (caution)")
@@ -162,16 +147,14 @@ def analyze_coin(df, timeframe, market_trend, market_score, fg_value, fg_text):
         final_score += 1
         reasons.append("Market is Bullish (caution)")
 
-    # Fear & Greed adjustment
     if fg_value is not None:
-        if tech_score > 0 and fg_value <= 25:      # Extreme Fear → good for buying
+        if tech_score > 0 and fg_value <= 25:
             final_score += 1
             reasons.append(f"Fear & Greed: {fg_text}")
-        elif tech_score < 0 and fg_value >= 75:    # Extreme Greed → good for selling
+        elif tech_score < 0 and fg_value >= 75:
             final_score -= 1
             reasons.append(f"Fear & Greed: {fg_text}")
 
-    # Final Signal
     if final_score >= 4:
         signal = "🟢 STRONG BUY"
     elif final_score >= 2:
@@ -194,7 +177,6 @@ def analyze_coin(df, timeframe, market_trend, market_score, fg_value, fg_text):
         "fg_text": fg_text
     }
 
-# ==================== TOP COINS ====================
 def get_top_coins(exchange):
     try:
         tickers = exchange.fetch_tickers()
@@ -209,21 +191,20 @@ def get_top_coins(exchange):
         return [x['symbol'] for x in usdt_pairs[:TOP_N]]
     except Exception as e:
         print("Error fetching top coins:", e)
-        return ["BTC/USDT", "ETH/USDT", "BNB/USDT", "SOL/USDT", "XRP/USDT"]
+        return ["BTC/USDT", "ETH/USDT", "SOL/USDT", "XRP/USDT", "DOGE/USDT"]
 
-# ==================== BOT LOOP ====================
 def run_bot():
-    exchange = ccxt.binance({
+    # Bybit use kar rahe hain (Binance block ho raha tha)
+    exchange = ccxt.bybit({
         'enableRateLimit': True,
         'options': {'defaultType': 'spot'}
     })
 
-    print("Upgraded Bot Started...")
-    send_telegram("✅ <b>Upgraded Crypto Signal Bot Started</b>\nTechnical + Market Analysis active")
+    print("Upgraded Bot Started (Bybit)...")
+    send_telegram("✅ <b>Crypto Signal Bot Started (Bybit)</b>\nTechnical + Market Analysis active")
 
     while True:
         try:
-            # Market Analysis
             market_trend, market_score = get_btc_trend(exchange)
             fg_value, fg_text = get_fear_greed()
 
