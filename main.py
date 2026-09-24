@@ -195,7 +195,7 @@ def get_top_coins(exchange):
 
 def run_bot():
     # Bybit use kar rahe hain (Binance block ho raha tha)
-    exchange = ccxt.bybit({
+    exchange = ccxt.okx({
         'enableRateLimit': True,
         'options': {'defaultType': 'spot'}
     })
