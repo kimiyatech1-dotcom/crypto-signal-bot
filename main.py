@@ -194,14 +194,13 @@ def get_top_coins(exchange):
         return ["BTC/USDT", "ETH/USDT", "SOL/USDT", "XRP/USDT", "DOGE/USDT"]
 
 def run_bot():
-    # Bybit use kar rahe hain (Binance block ho raha tha)
     exchange = ccxt.okx({
         'enableRateLimit': True,
         'options': {'defaultType': 'spot'}
     })
 
-    print("Upgraded Bot Started (Bybit)...")
-    send_telegram("✅ <b>Crypto Signal Bot Started (Bybit)</b>\nTechnical + Market Analysis active")
+    print("Crypto Signal Bot Started (OKX)...")
+    send_telegram("✅ <b>Crypto Signal Bot Started (OKX)</b>\nTechnical + Market Analysis active")
 
     while True:
         try:
