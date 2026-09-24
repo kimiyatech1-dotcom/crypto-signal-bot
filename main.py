@@ -37,6 +37,7 @@ def get_technical_score(df):
         return 0, []
 
     df['rsi'] = ta.rsi(df['close'], length=14)
+    
     macd = ta.macd(df['close'])
     df = pd.concat([df, macd], axis=1)
     
@@ -57,6 +58,7 @@ def get_technical_score(df):
     score = 0
     reasons = []
 
+    # RSI
     if last['rsi'] < 30:
         score += 2
         reasons.append("RSI Oversold")
@@ -70,6 +72,7 @@ def get_technical_score(df):
         score -= 1
         reasons.append("RSI High")
 
+    # MACD
     if last['MACD_12_26_9'] > last['MACDs_12_26_9'] and prev['MACD_12_26_9'] <= prev['MACDs_12_26_9']:
         score += 2
         reasons.append("MACD Bullish Cross")
@@ -77,6 +80,7 @@ def get_technical_score(df):
         score -= 2
         reasons.append("MACD Bearish Cross")
 
+    # EMA
     if last['ema9'] > last['ema21'] and prev['ema9'] <= prev['ema21']:
         score += 2
         reasons.append("EMA Bullish Cross")
@@ -84,29 +88,39 @@ def get_technical_score(df):
         score -= 2
         reasons.append("EMA Bearish Cross")
 
-bb_lower = None
-bb_upper = None
-for col in df.columns:
-    if 'BBL' in col:
-        bb_lower = col
-    if 'BBU' in col:
-        bb_upper = col
+    # Bollinger Bands (safe)
+    bb_lower = None
+    bb_upper = None
+    for col in df.columns:
+        if 'BBL' in str(col):
+            bb_lower = col
+        if 'BBU' in str(col):
+            bb_upper = col
 
-if bb_lower and bb_upper:
-    if last['close'] < last[bb_lower]:
-        score += 1
-        reasons.append("Below Lower BB")
-    elif last['close'] > last[bb_upper]:
-        score -= 1
-        reasons.append("Above Upper BB")
+    if bb_lower is not None and bb_upper is not None:
+        if last['close'] < last[bb_lower]:
+            score += 1
+            reasons.append("Below Lower BB")
+        elif last['close'] > last[bb_upper]:
+            score -= 1
+            reasons.append("Above Upper BB")
 
-    if last['STOCHRSIk_14_14_3_3'] < 20:
-        score += 1
-        reasons.append("StochRSI Oversold")
-    elif last['STOCHRSIk_14_14_3_3'] > 80:
-        score -= 1
-        reasons.append("StochRSI Overbought")
+    # Stochastic RSI
+    stoch_col = None
+    for col in df.columns:
+        if 'STOCHRSIk' in str(col):
+            stoch_col = col
+            break
 
+    if stoch_col is not None:
+        if last[stoch_col] < 20:
+            score += 1
+            reasons.append("StochRSI Oversold")
+        elif last[stoch_col] > 80:
+            score -= 1
+            reasons.append("StochRSI Overbought")
+
+    # Volume
     if last['volume'] > last['vol_ma'] * 1.8:
         if score > 0:
             score += 1
