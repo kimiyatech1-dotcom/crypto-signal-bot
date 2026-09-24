@@ -84,10 +84,19 @@ def get_technical_score(df):
         score -= 2
         reasons.append("EMA Bearish Cross")
 
-    if last['close'] < last['BBL_20_2.0']:
+bb_lower = None
+bb_upper = None
+for col in df.columns:
+    if 'BBL' in col:
+        bb_lower = col
+    if 'BBU' in col:
+        bb_upper = col
+
+if bb_lower and bb_upper:
+    if last['close'] < last[bb_lower]:
         score += 1
         reasons.append("Below Lower BB")
-    elif last['close'] > last['BBU_20_2.0']:
+    elif last['close'] > last[bb_upper]:
         score -= 1
         reasons.append("Above Upper BB")
 
