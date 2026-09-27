@@ -4,23 +4,38 @@ import pandas_ta as ta
 import requests
 import time
 import os
+import html
 from datetime import datetime, timezone
 
 # ============================================================
-# CONFIG
+# VERSION 2 CONFIG
 # ============================================================
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 CHAT_ID = os.environ.get("CHAT_ID")
 
-SCAN_INTERVAL = 900       # 15 minutes
-TOP_N = 30
-MIN_SCORE = 80
+SCAN_INTERVAL = 900          # Scan every 15 minutes
+TOP_N = 30                   # Coins to analyze
+MAX_SIGNALS_PER_SCAN = 2     # Only strongest setups per scan
+MAX_SIGNALS_PER_DAY = 6      # Hard daily Telegram limit
+
+MIN_SCORE = 90               # Strict confluence score
+MIN_ADX = 20
+MIN_VOLUME_RATIO = 1.10
 
 TIMEFRAMES = ["1d", "4h", "1h"]
 
-# Prevent repeated signals
+# Do not trade stablecoins against stablecoins.
+STABLE_BASES = {
+    "USDT", "USDC", "FDUSD", "DAI", "TUSD",
+    "USDP", "PYUSD", "BUSD", "USDE"
+}
+
+# Duplicate / cooldown control
 sent_signals = {}
+active_signals = {}
+daily_sent = 0
+daily_date = None
 
 # ============================================================
 # TELEGRAM
@@ -29,7 +44,7 @@ sent_signals = {}
 def send_telegram(message):
     if not TELEGRAM_TOKEN or not CHAT_ID:
         print("Telegram credentials missing.")
-        return
+        return False
 
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
 
@@ -40,17 +55,17 @@ def send_telegram(message):
     }
 
     try:
-        response = requests.post(
-            url,
-            data=payload,
-            timeout=10
-        )
+        response = requests.post(url, data=payload, timeout=10)
 
         if not response.ok:
             print("Telegram error:", response.text)
+            return False
+
+        return True
 
     except Exception as e:
         print("Telegram error:", e)
+        return False
 
 
 # ============================================================
@@ -58,19 +73,13 @@ def send_telegram(message):
 # ============================================================
 
 def get_fear_greed():
-
     try:
         r = requests.get(
             "https://api.alternative.me/fng/",
             timeout=10
         )
-
         data = r.json()["data"][0]
-
-        return (
-            int(data["value"]),
-            data["value_classification"]
-        )
+        return int(data["value"]), data["value_classification"]
 
     except Exception as e:
         print("Fear & Greed error:", e)
@@ -78,37 +87,28 @@ def get_fear_greed():
 
 
 # ============================================================
-# DATAFRAME
+# DATA
 # ============================================================
 
 def candles_to_df(ohlcv):
-
     df = pd.DataFrame(
         ohlcv,
         columns=[
-            "timestamp",
-            "open",
-            "high",
-            "low",
-            "close",
-            "volume"
+            "timestamp", "open", "high",
+            "low", "close", "volume"
         ]
     )
 
     df["timestamp"] = pd.to_datetime(
         df["timestamp"],
-        unit="ms"
+        unit="ms",
+        utc=True
     )
 
     return df
 
 
-# ============================================================
-# REMOVE CURRENT INCOMPLETE CANDLE
-# ============================================================
-
 def get_closed_candles(exchange, symbol, timeframe, limit=250):
-
     ohlcv = exchange.fetch_ohlcv(
         symbol,
         timeframe=timeframe,
@@ -117,14 +117,11 @@ def get_closed_candles(exchange, symbol, timeframe, limit=250):
 
     df = candles_to_df(ohlcv)
 
-    if len(df) < 50:
+    if len(df) < 210:
         return None
 
-    # Last candle can still be forming.
-    # Use only completed candles.
-    df = df.iloc[:-1].copy()
-
-    return df
+    # Never analyze the currently forming candle.
+    return df.iloc[:-1].copy()
 
 
 # ============================================================
@@ -132,44 +129,27 @@ def get_closed_candles(exchange, symbol, timeframe, limit=250):
 # ============================================================
 
 def add_indicators(df):
-
     df = df.copy()
 
-    # EMAs
     df["ema20"] = ta.ema(df["close"], length=20)
     df["ema50"] = ta.ema(df["close"], length=50)
     df["ema200"] = ta.ema(df["close"], length=200)
 
-    # RSI
-    df["rsi"] = ta.rsi(
-        df["close"],
-        length=14
-    )
+    df["rsi"] = ta.rsi(df["close"], length=14)
 
-    # MACD
     macd = ta.macd(df["close"])
-
     if macd is not None:
-        df = pd.concat(
-            [df, macd],
-            axis=1
-        )
+        df = pd.concat([df, macd], axis=1)
 
-    # ADX
     adx = ta.adx(
         df["high"],
         df["low"],
         df["close"],
         length=14
     )
-
     if adx is not None:
-        df = pd.concat(
-            [df, adx],
-            axis=1
-        )
+        df = pd.concat([df, adx], axis=1)
 
-    # ATR
     df["atr"] = ta.atr(
         df["high"],
         df["low"],
@@ -177,70 +157,45 @@ def add_indicators(df):
         length=14
     )
 
-    # Bollinger Bands
     bb = ta.bbands(
         df["close"],
         length=20,
         std=2
     )
-
     if bb is not None:
-        df = pd.concat(
-            [df, bb],
-            axis=1
-        )
+        df = pd.concat([df, bb], axis=1)
 
-    # Volume average
-    df["volume_ma"] = (
-        df["volume"]
-        .rolling(20)
-        .mean()
-    )
+    df["volume_ma"] = df["volume"].rolling(20).mean()
 
-    # Recent highs/lows
+    # Previous 20-candle structure, excluding current candle.
     df["recent_high"] = (
-        df["high"]
-        .rolling(20)
-        .max()
+        df["high"].shift(1).rolling(20).max()
     )
-
     df["recent_low"] = (
-        df["low"]
-        .rolling(20)
-        .min()
+        df["low"].shift(1).rolling(20).min()
     )
 
     return df.dropna().copy()
 
 
-# ============================================================
-# GET MACD HISTOGRAM
-# ============================================================
-
 def get_macd_histogram(row):
-
-    possible = [
-        "MACDh_12_26_9"
-    ]
-
-    for col in possible:
-        if col in row.index:
-            return row[col]
-
-    return 0
+    return float(row.get("MACDh_12_26_9", 0) or 0)
 
 
-# ============================================================
-# GET ADX
-# ============================================================
+def get_macd_line(row):
+    return float(row.get("MACD_12_26_9", 0) or 0)
+
+
+def get_macd_signal(row):
+    return float(row.get("MACDs_12_26_9", 0) or 0)
+
 
 def get_adx_values(row):
-
-    adx = row.get("ADX_14", 0)
-    plus = row.get("DMP_14", 0)
-    minus = row.get("DMN_14", 0)
-
-    return adx, plus, minus
+    return (
+        float(row.get("ADX_14", 0) or 0),
+        float(row.get("DMP_14", 0) or 0),
+        float(row.get("DMN_14", 0) or 0)
+    )
 
 
 # ============================================================
@@ -248,7 +203,6 @@ def get_adx_values(row):
 # ============================================================
 
 def analyze_timeframe(df, timeframe):
-
     df = add_indicators(df)
 
     if len(df) < 50:
@@ -260,501 +214,436 @@ def analyze_timeframe(df, timeframe):
     bullish = 0
     bearish = 0
 
-    reasons_bull = []
-    reasons_bear = []
+    bull_reasons = []
+    bear_reasons = []
 
-    # --------------------------------------------------------
-    # EMA TREND
-    # --------------------------------------------------------
-
-    if (
-        last["close"] > last["ema50"]
-        and last["ema50"] > last["ema200"]
-    ):
+    # Trend structure
+    if last["close"] > last["ema50"] > last["ema200"]:
         bullish += 20
-        reasons_bull.append(
-            "EMA50 > EMA200 + price above EMA50"
-        )
+        bull_reasons.append("Price > EMA50 > EMA200")
 
-    elif (
-        last["close"] < last["ema50"]
-        and last["ema50"] < last["ema200"]
-    ):
+    elif last["close"] < last["ema50"] < last["ema200"]:
         bearish += 20
-        reasons_bear.append(
-            "EMA50 < EMA200 + price below EMA50"
-        )
+        bear_reasons.append("Price < EMA50 < EMA200")
 
-    # --------------------------------------------------------
-    # EMA 20 MOMENTUM
-    # --------------------------------------------------------
-
+    # Short-term momentum
     if last["close"] > last["ema20"]:
         bullish += 5
-        reasons_bull.append("Price above EMA20")
+        bull_reasons.append("Price above EMA20")
 
     elif last["close"] < last["ema20"]:
         bearish += 5
-        reasons_bear.append("Price below EMA20")
+        bear_reasons.append("Price below EMA20")
 
-    # --------------------------------------------------------
     # RSI
-    # --------------------------------------------------------
+    rsi = float(last["rsi"])
 
-    rsi = last["rsi"]
-
-    if 50 <= rsi <= 68:
+    if 52 <= rsi <= 68:
         bullish += 10
-        reasons_bull.append(
-            f"RSI bullish ({rsi:.1f})"
-        )
+        bull_reasons.append(f"RSI healthy bullish ({rsi:.1f})")
 
-    elif 32 <= rsi < 50:
-        bearish += 5
-        reasons_bear.append(
-            f"RSI weak ({rsi:.1f})"
-        )
+    elif 32 <= rsi <= 48:
+        bearish += 10
+        bear_reasons.append(f"RSI healthy bearish ({rsi:.1f})")
 
     elif rsi > 72:
-        bearish += 8
-        reasons_bear.append(
-            f"RSI overbought ({rsi:.1f})"
-        )
+        bearish += 5
+        bear_reasons.append(f"RSI overextended ({rsi:.1f})")
 
     elif rsi < 28:
-        bullish += 8
-        reasons_bull.append(
-            f"RSI oversold ({rsi:.1f})"
-        )
+        bullish += 5
+        bull_reasons.append(f"RSI oversold ({rsi:.1f})")
 
-    # --------------------------------------------------------
     # MACD
-    # --------------------------------------------------------
+    hist = get_macd_histogram(last)
+    prev_hist = get_macd_histogram(previous)
+    macd_line = get_macd_line(last)
+    macd_signal = get_macd_signal(last)
 
-    macd_hist = get_macd_histogram(last)
-    prev_macd_hist = get_macd_histogram(previous)
-
-    if macd_hist > 0:
-
+    if hist > 0 and macd_line > macd_signal:
         bullish += 10
+        bull_reasons.append("MACD bullish")
 
-        reasons_bull.append(
-            "MACD histogram positive"
-        )
-
-        if prev_macd_hist <= 0:
+        if prev_hist <= 0:
             bullish += 5
-            reasons_bull.append(
-                "MACD bullish crossover"
-            )
+            bull_reasons.append("Fresh MACD bullish crossover")
 
-    elif macd_hist < 0:
-
+    elif hist < 0 and macd_line < macd_signal:
         bearish += 10
+        bear_reasons.append("MACD bearish")
 
-        reasons_bear.append(
-            "MACD histogram negative"
-        )
-
-        if prev_macd_hist >= 0:
+        if prev_hist >= 0:
             bearish += 5
-            reasons_bear.append(
-                "MACD bearish crossover"
-            )
+            bear_reasons.append("Fresh MACD bearish crossover")
 
-    # --------------------------------------------------------
-    # ADX / TREND STRENGTH
-    # --------------------------------------------------------
-
+    # ADX / DI
     adx, plus_di, minus_di = get_adx_values(last)
 
-    if adx >= 20:
-
+    if adx >= MIN_ADX:
         if plus_di > minus_di:
-
             bullish += 10
-
-            reasons_bull.append(
-                f"ADX trend bullish ({adx:.1f})"
-            )
-
+            bull_reasons.append(f"ADX bullish ({adx:.1f})")
         elif minus_di > plus_di:
-
             bearish += 10
+            bear_reasons.append(f"ADX bearish ({adx:.1f})")
 
-            reasons_bear.append(
-                f"ADX trend bearish ({adx:.1f})"
-            )
+    # Volume
+    volume_ratio = 0.0
+    if last["volume_ma"] > 0:
+        volume_ratio = float(last["volume"] / last["volume_ma"])
 
-    # --------------------------------------------------------
-    # VOLUME
-    # --------------------------------------------------------
-
-    if last["volume"] > last["volume_ma"] * 1.5:
-
+    if volume_ratio >= MIN_VOLUME_RATIO:
         if last["close"] > last["open"]:
-
             bullish += 5
-
-            reasons_bull.append(
-                "High bullish volume"
+            bull_reasons.append(
+                f"Volume confirmation ({volume_ratio:.1f}x)"
             )
-
         elif last["close"] < last["open"]:
-
             bearish += 5
-
-            reasons_bear.append(
-                "High bearish volume"
+            bear_reasons.append(
+                f"Volume confirmation ({volume_ratio:.1f}x)"
             )
 
-    # --------------------------------------------------------
-    # PRICE STRUCTURE
-    # --------------------------------------------------------
+    # Breakout / breakdown
+    previous_high = float(df["high"].iloc[-21:-1].max())
+    previous_low = float(df["low"].iloc[-21:-1].min())
 
-    previous_high = df["high"].iloc[-21:-1].max()
-    previous_low = df["low"].iloc[-21:-1].min()
+    breakout = last["close"] > previous_high
+    breakdown = last["close"] < previous_low
 
-    if last["close"] > previous_high:
-
+    if breakout:
         bullish += 10
+        bull_reasons.append("Breakout above recent structure")
 
-        reasons_bull.append(
-            "Breakout above recent high"
-        )
-
-    elif last["close"] < previous_low:
-
+    elif breakdown:
         bearish += 10
-
-        reasons_bear.append(
-            "Breakdown below recent low"
-        )
-
-    # --------------------------------------------------------
-    # DIRECTION
-    # --------------------------------------------------------
+        bear_reasons.append("Breakdown below recent structure")
 
     if bullish > bearish:
         direction = "BULLISH"
-
     elif bearish > bullish:
         direction = "BEARISH"
-
     else:
         direction = "NEUTRAL"
 
     return {
         "timeframe": timeframe,
+        "direction": direction,
         "bullish": bullish,
         "bearish": bearish,
-        "direction": direction,
-        "bull_reasons": reasons_bull,
-        "bear_reasons": reasons_bear,
+        "bull_reasons": bull_reasons,
+        "bear_reasons": bear_reasons,
         "price": float(last["close"]),
         "atr": float(last["atr"]),
-        "rsi": float(last["rsi"]),
-        "adx": float(adx),
-        "volume": float(last["volume"]),
-        "volume_ma": float(last["volume_ma"])
+        "rsi": rsi,
+        "adx": adx,
+        "volume_ratio": volume_ratio,
+        "timestamp": last["timestamp"],
+        "breakout": breakout,
+        "breakdown": breakdown
     }
 
 
 # ============================================================
-# BTC MARKET TREND
+# BTC MARKET
 # ============================================================
 
 def get_btc_market_analysis(exchange):
-
     results = {}
 
     for tf in TIMEFRAMES:
-
         try:
-
             df = get_closed_candles(
-                exchange,
-                "BTC/USDT",
-                tf,
-                250
+                exchange, "BTC/USDT", tf, 250
             )
 
             if df is None:
                 continue
 
-            analysis = analyze_timeframe(
-                df,
-                tf.upper()
-            )
+            result = analyze_timeframe(df, tf.upper())
 
-            if analysis:
-                results[tf] = analysis
+            if result:
+                results[tf] = result
 
         except Exception as e:
-
-            print(
-                f"BTC {tf} analysis error:",
-                e
-            )
+            print(f"BTC {tf} analysis error:", e)
 
     if not results:
         return "NEUTRAL", 0, results
 
     bullish_count = sum(
-        1
+        x["direction"] == "BULLISH"
         for x in results.values()
-        if x["direction"] == "BULLISH"
     )
 
     bearish_count = sum(
-        1
+        x["direction"] == "BEARISH"
         for x in results.values()
-        if x["direction"] == "BEARISH"
     )
 
     if bullish_count == 3:
-
         return "BULLISH", 3, results
 
     if bearish_count == 3:
-
         return "BEARISH", -3, results
 
     if bullish_count > bearish_count:
-
         return "BULLISH", 1, results
 
     if bearish_count > bullish_count:
-
         return "BEARISH", -1, results
 
     return "NEUTRAL", 0, results
 
 
 # ============================================================
-# BUILD SIGNAL
+# SIGNAL QUALITY
 # ============================================================
 
-def build_signal(
-    symbol,
-    analyses,
-    btc_trend,
-    fg_value,
-    fg_text
-):
-
-    if not all(
-        tf in analyses
-        for tf in ["1d", "4h", "1h"]
-    ):
+def build_signal(symbol, analyses, btc_trend, btc_score, fg_value, fg_text):
+    if not all(tf in analyses for tf in TIMEFRAMES):
         return None
 
     daily = analyses["1d"]
     four_h = analyses["4h"]
     one_h = analyses["1h"]
 
+    all_bullish = all(
+        analyses[tf]["direction"] == "BULLISH"
+        for tf in TIMEFRAMES
+    )
+
+    all_bearish = all(
+        analyses[tf]["direction"] == "BEARISH"
+        for tf in TIMEFRAMES
+    )
+
+    # Do not allow weak/sideways 1H entries.
+    if one_h["adx"] < MIN_ADX:
+        return None
+
     # ========================================================
     # LONG
     # ========================================================
 
-    long_score = 0
-    long_reasons = []
+    if all_bullish:
+        score = 0
+        reasons = []
 
-    # 1D = 30 points
-    if daily["direction"] == "BULLISH":
+        score += 30
+        reasons.append("1D bullish trend confirmed")
 
-        long_score += 30
+        score += 30
+        reasons.append("4H bullish structure confirmed")
 
-        long_reasons.append(
-            "1D bullish trend confirmed"
+        score += 25
+        reasons.append("1H bullish entry confirmation")
+
+        # BTC alignment: full points only when BTC is bullish.
+        if btc_trend == "BULLISH":
+            score += 10
+            reasons.append("BTC market aligned bullish")
+        elif btc_trend == "NEUTRAL":
+            score += 4
+            reasons.append("BTC market neutral")
+        else:
+            # Strongly bearish BTC is a hard filter.
+            if btc_score <= -3:
+                return None
+            score += 0
+            reasons.append("BTC market bearish — no alignment points")
+
+        # F&G is a small context filter, not a trade trigger.
+        if fg_value is not None and 35 <= fg_value <= 75:
+            score += 5
+            reasons.append(f"Market sentiment acceptable ({fg_value})")
+        elif fg_value is not None and fg_value > 85:
+            return None
+        else:
+            score += 0
+
+        # Strict 1H confirmation.
+        if one_h["rsi"] < 52 or one_h["rsi"] > 68:
+            return None
+
+        if one_h["volume_ratio"] < MIN_VOLUME_RATIO:
+            return None
+
+        if not (
+            one_h["bullish"] > one_h["bearish"]
+            and get_macd_histogram_from_analysis(one_h) > 0
+        ):
+            return None
+
+        # Reward structure confirmation.
+        reasons.extend(one_h["bull_reasons"][:5])
+
+        if score < MIN_SCORE:
+            return None
+
+        return make_long_signal(
+            symbol, score, reasons,
+            daily, four_h, one_h,
+            btc_trend, fg_text
         )
-
-    # 4H = 30 points
-    if four_h["direction"] == "BULLISH":
-
-        long_score += 30
-
-        long_reasons.append(
-            "4H bullish structure confirmed"
-        )
-
-    # 1H = 25 points
-    if one_h["direction"] == "BULLISH":
-
-        long_score += 25
-
-        long_reasons.append(
-            "1H entry confirmation bullish"
-        )
-
-    # BTC market = 10
-    if btc_trend == "BULLISH":
-
-        long_score += 10
-
-        long_reasons.append(
-            "BTC market trend bullish"
-        )
-
-    # Fear & Greed = 5
-    if fg_value is not None:
-
-        if fg_value < 75:
-
-            long_score += 5
-
-            long_reasons.append(
-                f"Fear & Greed acceptable ({fg_value})"
-            )
-
-    # Add technical evidence from 1H
-    long_reasons.extend(
-        one_h["bull_reasons"][:4]
-    )
 
     # ========================================================
     # SHORT
     # ========================================================
 
-    short_score = 0
-    short_reasons = []
+    if all_bearish:
+        score = 0
+        reasons = []
 
-    if daily["direction"] == "BEARISH":
+        score += 30
+        reasons.append("1D bearish trend confirmed")
 
-        short_score += 30
+        score += 30
+        reasons.append("4H bearish structure confirmed")
 
-        short_reasons.append(
-            "1D bearish trend confirmed"
+        score += 25
+        reasons.append("1H bearish entry confirmation")
+
+        if btc_trend == "BEARISH":
+            score += 10
+            reasons.append("BTC market aligned bearish")
+        elif btc_trend == "NEUTRAL":
+            score += 4
+            reasons.append("BTC market neutral")
+        else:
+            if btc_score >= 3:
+                return None
+            score += 0
+            reasons.append("BTC market bullish — no alignment points")
+
+        if fg_value is not None and 25 <= fg_value <= 65:
+            score += 5
+            reasons.append(f"Market sentiment acceptable ({fg_value})")
+        elif fg_value is not None and fg_value < 15:
+            return None
+
+        if one_h["rsi"] < 32 or one_h["rsi"] > 48:
+            return None
+
+        if one_h["volume_ratio"] < MIN_VOLUME_RATIO:
+            return None
+
+        if not (
+            one_h["bearish"] > one_h["bullish"]
+            and get_macd_histogram_from_analysis(one_h) < 0
+        ):
+            return None
+
+        reasons.extend(one_h["bear_reasons"][:5])
+
+        if score < MIN_SCORE:
+            return None
+
+        return make_short_signal(
+            symbol, score, reasons,
+            daily, four_h, one_h,
+            btc_trend, fg_text
         )
-
-    if four_h["direction"] == "BEARISH":
-
-        short_score += 30
-
-        short_reasons.append(
-            "4H bearish structure confirmed"
-        )
-
-    if one_h["direction"] == "BEARISH":
-
-        short_score += 25
-
-        short_reasons.append(
-            "1H entry confirmation bearish"
-        )
-
-    if btc_trend == "BEARISH":
-
-        short_score += 10
-
-        short_reasons.append(
-            "BTC market trend bearish"
-        )
-
-    if fg_value is not None:
-
-        if fg_value > 25:
-
-            short_score += 5
-
-            short_reasons.append(
-                f"Fear & Greed acceptable ({fg_value})"
-            )
-
-    short_reasons.extend(
-        one_h["bear_reasons"][:4]
-    )
-
-    # ========================================================
-    # REQUIRE ALL TIMEFRAMES TO AGREE
-    # ========================================================
-
-    all_bullish = (
-        daily["direction"] == "BULLISH"
-        and four_h["direction"] == "BULLISH"
-        and one_h["direction"] == "BULLISH"
-    )
-
-    all_bearish = (
-        daily["direction"] == "BEARISH"
-        and four_h["direction"] == "BEARISH"
-        and one_h["direction"] == "BEARISH"
-    )
-
-    # ========================================================
-    # LONG SIGNAL
-    # ========================================================
-
-    if all_bullish and long_score >= MIN_SCORE:
-
-        price = one_h["price"]
-        atr = one_h["atr"]
-
-        # ATR based stop
-        stop_loss = price - (atr * 1.5)
-
-        risk = price - stop_loss
-
-        tp1 = price + risk * 1.5
-        tp2 = price + risk * 2.5
-        tp3 = price + risk * 3.5
-
-        return {
-            "signal": "🟢 HIGH-CONFLUENCE LONG",
-            "side": "LONG",
-            "symbol": symbol,
-            "score": long_score,
-            "price": price,
-            "stop_loss": stop_loss,
-            "tp1": tp1,
-            "tp2": tp2,
-            "tp3": tp3,
-            "risk_reward": 3.5,
-            "reasons": list(dict.fromkeys(long_reasons)),
-            "daily": daily["direction"],
-            "four_h": four_h["direction"],
-            "one_h": one_h["direction"],
-            "btc": btc_trend,
-            "fg": fg_text
-        }
-
-    # ========================================================
-    # SHORT SIGNAL
-    # ========================================================
-
-    if all_bearish and short_score >= MIN_SCORE:
-
-        price = one_h["price"]
-        atr = one_h["atr"]
-
-        stop_loss = price + (atr * 1.5)
-
-        risk = stop_loss - price
-
-        tp1 = price - risk * 1.5
-        tp2 = price - risk * 2.5
-        tp3 = price - risk * 3.5
-
-        return {
-            "signal": "🔴 HIGH-CONFLUENCE SHORT",
-            "side": "SHORT",
-            "symbol": symbol,
-            "score": short_score,
-            "price": price,
-            "stop_loss": stop_loss,
-            "tp1": tp1,
-            "tp2": tp2,
-            "tp3": tp3,
-            "risk_reward": 3.5,
-            "reasons": list(dict.fromkeys(short_reasons)),
-            "daily": daily["direction"],
-            "four_h": four_h["direction"],
-            "one_h": one_h["direction"],
-            "btc": btc_trend,
-            "fg": fg_text
-        }
 
     return None
+
+
+# ============================================================
+# MACD STATE STORED IN ANALYSIS
+# ============================================================
+
+# These helpers use the direction/reason set because the original
+# dataframe is intentionally not kept in memory.
+def get_macd_histogram_from_analysis(analysis):
+    for reason in analysis.get("bull_reasons", []):
+        if "MACD bullish" in reason:
+            return 1.0
+    for reason in analysis.get("bear_reasons", []):
+        if "MACD bearish" in reason:
+            return -1.0
+    return 0.0
+
+
+# ============================================================
+# SIGNAL CONSTRUCTION
+# ============================================================
+
+def make_long_signal(
+    symbol, score, reasons,
+    daily, four_h, one_h,
+    btc_trend, fg_text
+):
+    price = one_h["price"]
+    atr = one_h["atr"]
+
+    stop_loss = price - (atr * 1.5)
+    risk = price - stop_loss
+
+    if risk <= 0:
+        return None
+
+    tp1 = price + risk * 1.5
+    tp2 = price + risk * 2.5
+    tp3 = price + risk * 3.5
+
+    return {
+        "signal": "🟢 HIGH-CONFLUENCE LONG",
+        "side": "LONG",
+        "symbol": symbol,
+        "score": score,
+        "price": price,
+        "stop_loss": stop_loss,
+        "tp1": tp1,
+        "tp2": tp2,
+        "tp3": tp3,
+        "risk_reward": 3.5,
+        "reasons": list(dict.fromkeys(reasons)),
+        "daily": daily["direction"],
+        "four_h": four_h["direction"],
+        "one_h": one_h["direction"],
+        "btc": btc_trend,
+        "fg": fg_text,
+        "candle_time": one_h["timestamp"]
+    }
+
+
+def make_short_signal(
+    symbol, score, reasons,
+    daily, four_h, one_h,
+    btc_trend, fg_text
+):
+    price = one_h["price"]
+    atr = one_h["atr"]
+
+    stop_loss = price + (atr * 1.5)
+    risk = stop_loss - price
+
+    if risk <= 0:
+        return None
+
+    tp1 = price - risk * 1.5
+    tp2 = price - risk * 2.5
+    tp3 = price - risk * 3.5
+
+    return {
+        "signal": "🔴 HIGH-CONFLUENCE SHORT",
+        "side": "SHORT",
+        "symbol": symbol,
+        "score": score,
+        "price": price,
+        "stop_loss": stop_loss,
+        "tp1": tp1,
+        "tp2": tp2,
+        "tp3": tp3,
+        "risk_reward": 3.5,
+        "reasons": list(dict.fromkeys(reasons)),
+        "daily": daily["direction"],
+        "four_h": four_h["direction"],
+        "one_h": one_h["direction"],
+        "btc": btc_trend,
+        "fg": fg_text,
+        "candle_time": one_h["timestamp"]
+    }
 
 
 # ============================================================
@@ -762,36 +651,40 @@ def build_signal(
 # ============================================================
 
 def format_price(price):
-
     if price >= 1000:
         return f"{price:,.2f}"
-
     if price >= 1:
         return f"{price:,.4f}"
-
     if price >= 0.01:
         return f"{price:.6f}"
-
     return f"{price:.8f}"
 
 
 # ============================================================
-# TELEGRAM SIGNAL
+# TELEGRAM HTML SAFE SIGNAL
 # ============================================================
 
 def format_signal(signal):
-
-    reasons = "\n".join(
-        f"• {r}"
+    reasons = "
+".join(
+        f"• {html.escape(str(r))}"
         for r in signal["reasons"][:10]
     )
 
+    symbol = html.escape(signal["symbol"])
+    side_signal = html.escape(signal["signal"])
+    daily = html.escape(signal["daily"])
+    four_h = html.escape(signal["four_h"])
+    one_h = html.escape(signal["one_h"])
+    btc = html.escape(signal["btc"])
+    fg = html.escape(str(signal["fg"]))
+
     return f"""
-<b>{signal["signal"]}</b>
+<b>{side_signal}</b>
 
 ━━━━━━━━━━━━━━━━━━
 
-🪙 <b>Coin:</b> {signal["symbol"]}
+🪙 <b>Coin:</b> {symbol}
 
 💰 <b>Entry:</b>
 {format_price(signal["price"])}
@@ -811,15 +704,15 @@ def format_signal(signal):
 📊 <b>Confluence Score:</b>
 {signal["score"]}/100
 
-📈 <b>1D:</b> {signal["daily"]}
-📊 <b>4H:</b> {signal["four_h"]}
-⏰ <b>1H:</b> {signal["one_h"]}
+📈 <b>1D:</b> {daily}
+📊 <b>4H:</b> {four_h}
+⏰ <b>1H:</b> {one_h}
 
 ₿ <b>BTC Market:</b>
-{signal["btc"]}
+{btc}
 
-😱 <b>Fear & Greed:</b>
-{signal["fg"]}
+😱 <b>Fear &amp; Greed:</b>
+{fg}
 
 ⚖️ <b>Target R:R:</b>
 1:{signal["risk_reward"]}
@@ -838,20 +731,21 @@ Use proper risk management.</i>
 
 
 # ============================================================
-# TOP COINS
+# COIN UNIVERSE
 # ============================================================
 
 def get_top_coins(exchange):
-
     try:
-
         tickers = exchange.fetch_tickers()
-
         usdt_pairs = []
 
         for symbol, data in tickers.items():
-
             if not symbol.endswith("/USDT"):
+                continue
+
+            base = symbol.split("/")[0].upper()
+
+            if base in STABLE_BASES:
                 continue
 
             quote_volume = data.get("quoteVolume")
@@ -859,54 +753,39 @@ def get_top_coins(exchange):
             if not quote_volume:
                 continue
 
-            # Ignore leveraged / weird tokens
             if any(
                 x in symbol
                 for x in [
-                    "UP/",
-                    "DOWN/",
-                    "3L/",
-                    "3S/",
-                    "5L/",
-                    "5S/"
+                    "UP/", "DOWN/", "3L/",
+                    "3S/", "5L/", "5S/"
                 ]
             ):
                 continue
 
-            usdt_pairs.append(
-                {
-                    "symbol": symbol,
-                    "volume": float(quote_volume)
-                }
-            )
+            usdt_pairs.append({
+                "symbol": symbol,
+                "volume": float(quote_volume)
+            })
 
         usdt_pairs.sort(
             key=lambda x: x["volume"],
             reverse=True
         )
 
+        coins = [x["symbol"] for x in usdt_pairs[:TOP_N]]
+
+        # Exclude BTC from altcoin candidates because BTC
+        # is already used as the market filter.
         coins = [
-            x["symbol"]
-            for x in usdt_pairs[:TOP_N]
+            x for x in coins
+            if x not in {"BTC/USDT", "USDC/USDT"}
         ]
 
-        # Make sure BTC and ETH are included
-        for major in ["BTC/USDT", "ETH/USDT"]:
-
-            if major not in coins:
-                coins.append(major)
-
-        return coins[:TOP_N]
+        return coins
 
     except Exception as e:
-
-        print(
-            "Top coins error:",
-            e
-        )
-
+        print("Top coins error:", e)
         return [
-            "BTC/USDT",
             "ETH/USDT",
             "SOL/USDT",
             "XRP/USDT",
@@ -915,65 +794,131 @@ def get_top_coins(exchange):
 
 
 # ============================================================
-# MAIN SCANNER
+# DAILY LIMIT / DUPLICATE CONTROL
+# ============================================================
+
+def reset_daily_counter():
+    global daily_sent, daily_date
+
+    today = datetime.now(timezone.utc).date()
+
+    if daily_date != today:
+        daily_date = today
+        daily_sent = 0
+
+
+def signal_key(signal):
+    # Same direction + same completed 1H candle = same setup.
+    candle = signal["candle_time"].isoformat()
+    return f"{signal['symbol']}|{signal['side']}|{candle}"
+
+
+def has_active_same_coin(symbol):
+    return symbol in active_signals
+
+
+def remember_signal(signal):
+    global daily_sent
+
+    key = signal_key(signal)
+
+    sent_signals[key] = time.time()
+
+    active_signals[signal["symbol"]] = {
+        "side": signal["side"],
+        "entry": signal["price"],
+        "sl": signal["stop_loss"],
+        "tp1": signal["tp1"],
+        "tp2": signal["tp2"],
+        "tp3": signal["tp3"],
+        "created": time.time()
+    }
+
+    daily_sent += 1
+
+
+
+# ============================================================
+# ACTIVE SIGNAL HOUSEKEEPING
+# ============================================================
+
+def cleanup_active_signals(exchange):
+    """Remove setups that have reached SL/TP3 or expired."""
+    now = time.time()
+    expired = []
+
+    for symbol, data in list(active_signals.items()):
+        try:
+            # 24-hour maximum lifetime for an unresolved setup.
+            if now - data["created"] > 24 * 60 * 60:
+                expired.append(symbol)
+                continue
+
+            ticker = exchange.fetch_ticker(symbol)
+            current = ticker.get("last")
+
+            if current is None:
+                continue
+
+            current = float(current)
+
+            if data["side"] == "LONG":
+                if current <= data["sl"] or current >= data["tp3"]:
+                    expired.append(symbol)
+
+            elif data["side"] == "SHORT":
+                if current >= data["sl"] or current <= data["tp3"]:
+                    expired.append(symbol)
+
+        except Exception as e:
+            print(f"Active signal check error {symbol}:", e)
+
+    for symbol in expired:
+        active_signals.pop(symbol, None)
+
+# ============================================================
+# SCAN
 # ============================================================
 
 def scan_market(exchange):
+    global sent_signals, active_signals
 
-    global sent_signals
-
-    # --------------------------------------------------------
-    # BTC MARKET
-    # --------------------------------------------------------
+    reset_daily_counter()
+    cleanup_active_signals(exchange)
 
     btc_trend, btc_score, btc_analysis = (
         get_btc_market_analysis(exchange)
     )
 
-    # --------------------------------------------------------
-    # FEAR & GREED
-    # --------------------------------------------------------
-
     fg_value, fg_text = get_fear_greed()
-
-    # --------------------------------------------------------
-    # COINS
-    # --------------------------------------------------------
 
     coins = get_top_coins(exchange)
 
     print(
-        f"\n[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}]"
+        f"
+[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}]"
     )
+    print(f"BTC Market: {btc_trend}")
+    print(f"Fear & Greed: {fg_text}")
+    print(f"Scanning {len(coins)} coins...")
+    print(f"Daily signals: {daily_sent}/{MAX_SIGNALS_PER_DAY}")
 
-    print(
-        f"BTC Market: {btc_trend}"
-    )
+    if daily_sent >= MAX_SIGNALS_PER_DAY:
+        print("Daily signal limit reached. No new signals.")
+        return
 
-    print(
-        f"Fear & Greed: {fg_text}"
-    )
-
-    print(
-        f"Scanning {len(coins)} coins..."
-    )
-
-    # --------------------------------------------------------
-    # EACH COIN
-    # --------------------------------------------------------
+    candidates = []
 
     for symbol in coins:
-
         try:
+            # Do not repeatedly alert on a coin that already has
+            # an unresolved setup.
+            if has_active_same_coin(symbol):
+                continue
 
             analyses = {}
 
-            # ----------------------------------------------
-            # GET 1D / 4H / 1H
-            # ----------------------------------------------
-
             for tf in TIMEFRAMES:
-
                 df = get_closed_candles(
                     exchange,
                     symbol,
@@ -992,70 +937,65 @@ def scan_market(exchange):
                 if result:
                     analyses[tf] = result
 
-            # ----------------------------------------------
-            # BUILD SIGNAL
-            # ----------------------------------------------
-
             signal = build_signal(
                 symbol,
                 analyses,
                 btc_trend,
+                btc_score,
                 fg_value,
                 fg_text
             )
 
-            if not signal:
-                continue
+            if signal:
+                candidates.append(signal)
 
-            # ----------------------------------------------
-            # SIGNAL ID
-            # ----------------------------------------------
+        except Exception as e:
+            print(f"Error analyzing {symbol}:", e)
 
-            candle_time = analyses["1h"]["price"]
+    # Strongest candidates first.
+    candidates.sort(
+        key=lambda x: x["score"],
+        reverse=True
+    )
 
-            signal_id = (
-                f"{symbol}_"
-                f"{signal['side']}_"
-                f"{candle_time}"
-            )
+    remaining = MAX_SIGNALS_PER_SCAN
 
-            # Don't send same signal repeatedly
-            if signal_id in sent_signals:
-                continue
+    for signal in candidates:
+        if remaining <= 0:
+            break
 
-            # ----------------------------------------------
-            # SEND
-            # ----------------------------------------------
+        if daily_sent >= MAX_SIGNALS_PER_DAY:
+            break
 
-            message = format_signal(signal)
+        key = signal_key(signal)
 
-            send_telegram(message)
+        if key in sent_signals:
+            continue
 
-            sent_signals[signal_id] = time.time()
+        message = format_signal(signal)
+
+        if send_telegram(message):
+            remember_signal(signal)
+            remaining -= 1
 
             print(
                 f"🚨 SIGNAL: "
-                f"{symbol} "
+                f"{signal['symbol']} "
                 f"{signal['side']} "
                 f"{signal['score']}/100"
             )
 
             time.sleep(1.5)
 
-        except Exception as e:
+    print(
+        f"Candidates found: {len(candidates)} | "
+        f"Signals sent: {MAX_SIGNALS_PER_SCAN - remaining}"
+    )
 
-            print(
-                f"Error analyzing {symbol}:",
-                e
-            )
-
-            continue
-
-    # Keep memory small
-    if len(sent_signals) > 500:
-
+    # Keep memory bounded.
+    if len(sent_signals) > 1000:
         sent_signals = dict(
-            list(sent_signals.items())[-250:]
+            list(sent_signals.items())[-500:]
         )
 
 
@@ -1064,107 +1004,72 @@ def scan_market(exchange):
 # ============================================================
 
 def run_bot():
-
-    exchange = ccxt.okx(
-        {
-            "enableRateLimit": True,
-            "options": {
-                "defaultType": "spot"
-            }
+    exchange = ccxt.okx({
+        "enableRateLimit": True,
+        "options": {
+            "defaultType": "spot"
         }
-    )
+    })
 
-    print(
-        "================================================"
-    )
-
-    print(
-        "Crypto High-Confluence Signal Bot Started"
-    )
-
-    print(
-        "Exchange: OKX"
-    )
-
-    print(
-        "Timeframes: 1D + 4H + 1H"
-    )
-
-    print(
-        "Minimum Score:",
-        MIN_SCORE
-    )
-
-    print(
-        "================================================"
-    )
+    print("================================================")
+    print("Crypto High-Confluence Signal Bot V2 Started")
+    print("Exchange: OKX")
+    print("Timeframes: 1D + 4H + 1H")
+    print("Minimum Score:", MIN_SCORE)
+    print("Max Signals / Scan:", MAX_SIGNALS_PER_SCAN)
+    print("Max Signals / Day:", MAX_SIGNALS_PER_DAY)
+    print("================================================")
 
     send_telegram(
         """
-✅ <b>Crypto Signal Bot Started</b>
+<b>🚀 Crypto Signal Bot V2 Started</b>
 
 Exchange: OKX
 
-Analysis:
+<b>Strict Analysis:</b>
 • 1D Trend
 • 4H Structure
-• 1H Confirmation
-• BTC Market
+• 1H Entry
+• BTC Market Alignment
+• EMA 20/50/200
 • RSI
 • MACD
-• EMA 20/50/200
 • ADX
 • Volume
 • ATR
-• Fear & Greed
+• Fear &amp; Greed
+• Duplicate Protection
+• Signal Ranking
 
-🎯 Minimum Confluence: 80/100
+🎯 Minimum Confluence: 90/100
+📨 Max Signals/Scan: 2
+📅 Max Signals/Day: 6
 
-Bot will only send high-confluence setups.
+Bot will stay silent when no strong setup exists.
+
+⚠️ Paper/demo testing only.
 """
     )
 
     while True:
-
         try:
-
             scan_market(exchange)
 
             print(
-                f"\nScan complete."
-            )
-
-            print(
-                f"Next scan in "
+                f"Scan complete. Next scan in "
                 f"{SCAN_INTERVAL // 60} minutes."
             )
 
-            time.sleep(
-                SCAN_INTERVAL
-            )
+            time.sleep(SCAN_INTERVAL)
 
         except KeyboardInterrupt:
-
-            print(
-                "Bot stopped."
-            )
-
+            print("Bot stopped.")
             break
 
         except Exception as e:
-
-            print(
-                "MAIN ERROR:",
-                e
-            )
-
+            print("MAIN ERROR:", e)
             time.sleep(60)
 
 
-# ============================================================
-# START
-# ============================================================
-
 if __name__ == "__main__":
-
     run_bot()
