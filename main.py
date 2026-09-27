@@ -665,8 +665,7 @@ def format_price(price):
 # ============================================================
 
 def format_signal(signal):
-    reasons = "
-".join(
+    reasons = "\n".join(
         f"• {html.escape(str(r))}"
         for r in signal["reasons"][:10]
     )
@@ -895,8 +894,7 @@ def scan_market(exchange):
     coins = get_top_coins(exchange)
 
     print(
-        f"
-[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}]"
+        f"\n[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}]"
     )
     print(f"BTC Market: {btc_trend}")
     print(f"Fear & Greed: {fg_text}")
