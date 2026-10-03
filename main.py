@@ -1,3512 +1,597 @@
-import ccxt
-import pandas as pd
-import requests
-import time
-import os
-import json
-import math
-import html
+import os, re, json, time, html, math, traceback, threading
+import xml.etree.ElementTree as ET
 from datetime import datetime, timezone, timedelta
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import requests, pandas as pd
 
+# ========================= V4 CONFIG =========================
+APP="CRYPTO SIGNAL BOT V4"
+BASE=os.getenv("OKX_BASE_URL","https://www.okx.com").rstrip("/")
+TOKEN=os.getenv("TELEGRAM_TOKEN","").strip()
+CHAT_ID=os.getenv("CHAT_ID","").strip()
+SCAN_INTERVAL=int(os.getenv("SCAN_INTERVAL","900"))
+MAX_UNIVERSE=int(os.getenv("MAX_UNIVERSE","80"))
+FETCH_WORKERS=int(os.getenv("FETCH_WORKERS","6"))
+MAX_CONFIRMED=int(os.getenv("MAX_CONFIRMED_PER_SCAN","3"))
+MAX_EARLY=int(os.getenv("MAX_EARLY_PER_SCAN","5"))
+DAILY_CONF=int(os.getenv("DAILY_CONFIRMED_LIMIT","5"))
+DAILY_EARLY=int(os.getenv("DAILY_EARLY_LIMIT","8"))
+NEWS_HOURS=float(os.getenv("NEWS_LOOKBACK_HOURS","12"))
+ENABLE_NEWS=os.getenv("ENABLE_NEWS","true").lower() in ("1","true","yes","on")
+STATE_FILE=os.getenv("STATE_FILE","v4_state.json")
+JOURNAL_FILE=os.getenv("JOURNAL_FILE","v4_journal.jsonl")
+STABLE={"USDT","USDC","USDE","DAI","FDUSD","TUSD","USDD","USDG","PYUSD","EURC"}
+LEV=re.compile(r"(^|[-_])(2L|2S|3L|3S|5L|5S)([-_]|$)",re.I)
+S=requests.Session()
+S.headers.update({"User-Agent":"CryptoSignalBotV4/4.0","Accept":"application/json,text/xml,*/*"})
+LOCK=threading.Lock()
+ACTIVE={}
+COOLDOWN={}
+EARLY_STATE={}
+DAILY={"date":"","confirmed":0,"early":0}
+NEWS_CACHE={"ts":0,"items":[]}
+DERIV_CACHE={}
+FNG_CACHE={"ts":0,"value":None}
 
-# ============================================================
-# V3 CRYPTO MARKET INTELLIGENCE SIGNAL BOT
-# ============================================================
-#
-# IMPORTANT:
-# - This bot generates signals only.
-# - It does NOT place trades.
-# - LONG and SHORT are evaluated independently.
-# - 1H reversal has strong authority.
-# - BTC regime is separate from individual coin direction.
-# - Early Momentum is separate from Confirmed setups.
-# - News/fundamental API is NOT faked. It is marked unavailable
-#   unless a real source is connected.
-#
-# ============================================================
+RSS=os.getenv(
+    "NEWS_RSS_URLS",
+    "https://www.coindesk.com/arc/outboundfeeds/rss/?outputType=xml,"
+    "https://cointelegraph.com/rss,https://cryptopotato.com/feed/,"
+    "https://cryptoslate.com/feed/,https://cryptonews.com/news/feed/,"
+    "https://finance.yahoo.com/news/rssindex"
+).split(",")
 
-
-# -----------------------------
-# TELEGRAM
-# -----------------------------
-
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
-CHAT_ID = os.environ.get("CHAT_ID")
-
-
-# -----------------------------
-# SCANNER SETTINGS
-# -----------------------------
-
-SCAN_INTERVAL = 900                 # 15 minutes
-
-# Wider universe than old V2.
-# We first inspect the exchange universe and then technically
-# analyze the most liquid/active coins.
-MAX_UNIVERSE = 100
-
-MAX_CONFIRMED_PER_SCAN = 2
-MAX_EARLY_PER_SCAN = 1
-
-MAX_CONFIRMED_PER_DAY = 5
-MAX_EARLY_PER_DAY = 3
-
-MIN_CONFIRMED_SCORE = 72
-MIN_EARLY_SCORE = 64
-
-MIN_ADX = 18
-MIN_VOLUME_RATIO = 1.05
-
-TIMEFRAMES = ["1d", "4h", "1h"]
-
-STABLE_BASES = {
-    "USDT",
-    "USDC",
-    "FDUSD",
-    "DAI",
-    "TUSD",
-    "USDP",
-    "PYUSD",
-    "BUSD",
-    "USDE",
-    "USD1",
+POS={"approval":2,"approved":2,"adoption":2,"partnership":2,"integration":2,
+     "upgrade":1,"mainnet":2,"institutional":2,"inflows":2,"buyback":2,
+     "burn":2,"tokenization":2,"etf":2,"listing":1,"launch":1}
+NEG={"hack":-5,"exploit":-5,"breach":-5,"stolen":-5,"lawsuit":-2,"ban":-3,
+     "delist":-4,"outflow":-2,"liquidation":-2,"unlock":-1,"attack":-5,
+     "vulnerability":-4,"scam":-5,"bankrupt":-5}
+MACRO={"fed":3,"fomc":4,"rate cut":4,"rate hike":-4,"interest rate":3,
+       "pce":4,"cpi":4,"inflation":3,"payroll":4,"jobs":3,"unemployment":3,
+       "gdp":3,"treasury yield":-3,"bond yield":-3,"dxy":-2,"recession":-4,
+       "etf inflow":3,"etf outflow":-3,"institutional":2}
+ALIASES={
+ "BTC":["bitcoin","btc"],"ETH":["ethereum","ether","eth"],"AAVE":["aave"],
+ "WLD":["worldcoin","world"],"VIRTUAL":["virtual","virtuals"],
+ "VIRT":["virtual","virtuals"],"ONDO":["ondo"],"QNT":["quant"],
+ "ZEC":["zcash","zec"],"CRV":["curve","crv"],"LINK":["chainlink","link"],
+ "COMP":["compound","comp"],"SUI":["sui"],"DOGE":["dogecoin","doge"],
+ "LTC":["litecoin","ltc"]
 }
 
-# Avoid obvious leveraged tokens.
-LEVERAGED_WORDS = (
-    "3L",
-    "3S",
-    "5L",
-    "5S",
-    "2L",
-    "2S",
-    "BULL",
-    "BEAR",
-)
+def now(): return datetime.now(timezone.utc)
+def iso(): return now().isoformat()
+def f(v,d=None):
+    try: return float(v)
+    except: return d
+def clamp(x,a,b): return max(a,min(b,x))
+def pct(a,b):
+    return None if a is None or not b else (a/b-1)*100
+def price(x):
+    if x is None:return "n/a"
+    if x>=1000:return f"{x:,.2f}"
+    if x>=1:return f"{x:.4f}"
+    if x>=.1:return f"{x:.5f}"
+    if x>=.01:return f"{x:.6f}"
+    return f"{x:.8f}"
 
-JOURNAL_FILE = "signal_journal.json"
+def get(url,params=None,timeout=12):
+    last=None
+    for i in range(3):
+        try:
+            r=S.get(url,params=params,timeout=timeout)
+            if r.status_code==429: raise RuntimeError("429 rate limit")
+            r.raise_for_status(); return r
+        except Exception as e:
+            last=e; time.sleep(.4*(2**i))
+    raise last
 
-COOLDOWN_HOURS_AFTER_SL = 12
-REENTRY_CONFIRMATION_HOURS = 2
+def okx(path,params=None):
+    d=get(BASE+path,params).json()
+    if d.get("code") not in (None,"0",0): raise RuntimeError(d.get("msg","OKX error"))
+    return d.get("data",[])
 
-# Do not chase an already vertical move.
-MAX_1H_EXTENSION_FOR_NORMAL_ENTRY = 8.0
-MAX_4H_EXTENSION_FOR_NORMAL_ENTRY = 18.0
-
-# Early radar thresholds.
-EARLY_VOLUME_RATIO = 1.60
-EARLY_1H_MOVE = 2.5
-EARLY_4H_MOVE = 5.0
-
-# Derivatives are fetched only for stronger candidates so that
-# the scanner does not hammer public endpoints.
-DERIVATIVE_CANDIDATES = 20
-
-OKX_BASE_URL = "https://www.okx.com"
-
-
-# -----------------------------
-# GLOBAL STATE
-# -----------------------------
-
-active_signals = {}
-cooldowns = {}
-
-daily_confirmed_sent = 0
-daily_early_sent = 0
-daily_date = None
-
-journal = []
-
-
-# ============================================================
-# BASIC HELPERS
-# ============================================================
-
-def now_utc():
-    return datetime.now(timezone.utc)
-
-
-def safe_float(value, default=0.0):
+def save():
     try:
-        if value is None:
-            return default
-        return float(value)
-    except Exception:
-        return default
+        with open(STATE_FILE,"w",encoding="utf8") as x:
+            json.dump({"active":ACTIVE,"cooldown":COOLDOWN,"early":EARLY_STATE,"daily":DAILY},x,indent=2)
+    except: pass
 
-
-def clamp(value, low, high):
-    return max(low, min(high, value))
-
-
-def pct_change(a, b):
-    a = safe_float(a)
-    b = safe_float(b)
-
-    if a == 0:
-        return 0.0
-
-    return ((b - a) / a) * 100.0
-
-
-def format_price(price):
-    price = safe_float(price)
-
-    if price >= 1000:
-        return f"{price:,.2f}"
-
-    if price >= 100:
-        return f"{price:,.3f}"
-
-    if price >= 1:
-        return f"{price:,.4f}"
-
-    if price >= 0.01:
-        return f"{price:.6f}"
-
-    return f"{price:.8f}"
-
-
-def format_pct(value):
-    return f"{safe_float(value):+.2f}%"
-
-
-def send_telegram(message):
-    if not TELEGRAM_TOKEN or not CHAT_ID:
-        print("Telegram credentials missing.")
-        return False
-
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-
-    payload = {
-        "chat_id": CHAT_ID,
-        "text": message,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": True,
-    }
-
+def load():
+    global ACTIVE,COOLDOWN,EARLY_STATE,DAILY
     try:
-        response = requests.post(
-            url,
-            data=payload,
-            timeout=15,
-        )
+        x=json.load(open(STATE_FILE,encoding="utf8"))
+        ACTIVE=x.get("active",{}); COOLDOWN=x.get("cooldown",{})
+        EARLY_STATE=x.get("early",{}); DAILY=x.get("daily",DAILY)
+    except: pass
 
-        if not response.ok:
-            print("Telegram error:", response.text)
-            return False
+def journal(event,data):
+    try:
+        with open(JOURNAL_FILE,"a",encoding="utf8") as x:
+            x.write(json.dumps({"ts":iso(),"event":event,**data},ensure_ascii=False)+"\n")
+    except: pass
 
-        return True
-
+def tg(msg):
+    if not TOKEN or not CHAT_ID:
+        print("Telegram credentials missing"); return False
+    try:
+        r=S.post(f"https://api.telegram.org/bot{TOKEN}/sendMessage",
+                 json={"chat_id":CHAT_ID,"text":msg,"parse_mode":"HTML",
+                       "disable_web_page_preview":True},timeout=12)
+        r.raise_for_status(); return True
     except Exception as e:
-        print("Telegram exception:", e)
-        return False
+        print("Telegram:",e); return False
 
+# ========================= MARKET =========================
+def universe():
+    ins=okx("/api/v5/public/instruments",{"instType":"SPOT"})
+    live=[]
+    for z in ins:
+        i=z.get("instId","")
+        if z.get("state")!="live" or not i.endswith("-USDT"): continue
+        b=i[:-5]
+        if b in STABLE or LEV.search(b): continue
+        live.append(i)
+    ticks=okx("/api/v5/market/tickers",{"instType":"SPOT"})
+    vol={z.get("instId"):f(z.get("volCcy24h"),0) for z in ticks}
+    live.sort(key=lambda i:vol.get(i,0),reverse=True)
+    if "BTC-USDT" in live:
+        live.remove("BTC-USDT"); live.insert(0,"BTC-USDT")
+    return live[:MAX_UNIVERSE],len(live)
 
-# ============================================================
-# FEAR & GREED
-# ============================================================
-
-def get_fear_greed():
-    try:
-        response = requests.get(
-            "https://api.alternative.me/fng/",
-            timeout=10,
-        )
-
-        data = response.json()["data"][0]
-
-        return (
-            int(data["value"]),
-            data["value_classification"],
-        )
-
-    except Exception as e:
-        print("Fear & Greed error:", e)
-        return None, "Unknown"
-
-
-# ============================================================
-# JOURNAL
-# ============================================================
-
-def load_journal():
-    global journal
-
-    try:
-        if not os.path.exists(JOURNAL_FILE):
-            journal = []
-            return
-
-        with open(JOURNAL_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-
-        if isinstance(data, list):
-            journal = data
-        else:
-            journal = []
-
-    except Exception as e:
-        print("Journal load error:", e)
-        journal = []
-
-
-def save_journal():
-    try:
-        # Keep file from growing forever.
-        recent = journal[-1000:]
-
-        with open(JOURNAL_FILE, "w", encoding="utf-8") as f:
-            json.dump(
-                recent,
-                f,
-                indent=2,
-                ensure_ascii=False,
-            )
-
-    except Exception as e:
-        print("Journal save error:", e)
-
-
-def journal_event(event):
-    event = dict(event)
-    event["logged_at"] = now_utc().isoformat()
-
-    journal.append(event)
-
-    save_journal()
-
-
-# ============================================================
-# DAILY LIMIT
-# ============================================================
-
-def reset_daily_counter():
-    global daily_date
-    global daily_confirmed_sent
-    global daily_early_sent
-
-    today = now_utc().date()
-
-    if daily_date != today:
-        daily_date = today
-        daily_confirmed_sent = 0
-        daily_early_sent = 0
-
-
-# ============================================================
-# CANDLE DATA
-# ============================================================
-
-def candles_to_df(ohlcv):
-    if not ohlcv:
-        return None
-
-    df = pd.DataFrame(
-        ohlcv,
-        columns=[
-            "timestamp",
-            "open",
-            "high",
-            "low",
-            "close",
-            "volume",
-        ],
-    )
-
-    df["timestamp"] = pd.to_datetime(
-        df["timestamp"],
-        unit="ms",
-        utc=True,
-    )
-
-    for column in [
-        "open",
-        "high",
-        "low",
-        "close",
-        "volume",
-    ]:
-        df[column] = pd.to_numeric(
-            df[column],
-            errors="coerce",
-        )
-
-    df = df.dropna().reset_index(drop=True)
-
+def candles(inst,bar,limit=220):
+    d=okx("/api/v5/market/candles",{"instId":inst,"bar":bar,"limit":min(limit,300)})
+    if not d:return pd.DataFrame()
+    cols=["ts","open","high","low","close","volume","vb","vq","confirm"]
+    df=pd.DataFrame(d,columns=cols[:len(d[0])])
+    for c in cols[1:8]:
+        if c in df: df[c]=pd.to_numeric(df[c],errors="coerce")
+    df["ts"]=pd.to_datetime(pd.to_numeric(df["ts"]),unit="ms",utc=True)
+    df=df.sort_values("ts").drop_duplicates("ts").reset_index(drop=True)
+    if len(df)>2 and str(df.iloc[-1].get("confirm","1"))!="1": df=df.iloc[:-1]
     return df
 
+# ========================= INDICATORS =========================
+def ema(s,n): return s.ewm(span=n,adjust=False,min_periods=n).mean()
+def rsi(s,n=14):
+    d=s.diff(); up=d.clip(lower=0); dn=-d.clip(upper=0)
+    ag=up.ewm(alpha=1/n,adjust=False,min_periods=n).mean()
+    al=dn.ewm(alpha=1/n,adjust=False,min_periods=n).mean()
+    return (100-100/(1+ag/al.replace(0,math.nan))).fillna(50)
+def atr(df,n=14):
+    p=df.close.shift(1)
+    tr=pd.concat([df.high-df.low,(df.high-p).abs(),(df.low-p).abs()],axis=1).max(axis=1)
+    return tr.ewm(alpha=1/n,adjust=False,min_periods=n).mean()
+def macd(s):
+    m=ema(s,12)-ema(s,26); sig=ema(m,9); return m,sig,m-sig
+def adx(df,n=14):
+    up=df.high.diff(); dn=-df.low.diff()
+    p=up.where((up>dn)&(up>0),0); m=dn.where((dn>up)&(dn>0),0)
+    prev=df.close.shift(1)
+    tr=pd.concat([df.high-df.low,(df.high-prev).abs(),(df.low-prev).abs()],axis=1).max(axis=1)
+    av=tr.ewm(alpha=1/n,adjust=False,min_periods=n).mean()
+    pi=100*p.ewm(alpha=1/n,adjust=False,min_periods=n).mean()/av
+    mi=100*m.ewm(alpha=1/n,adjust=False,min_periods=n).mean()/av
+    dx=100*(pi-mi).abs()/(pi+mi).replace(0,math.nan)
+    return dx.ewm(alpha=1/n,adjust=False,min_periods=n).mean(),pi,mi
 
-def get_closed_candles(
-    exchange,
-    symbol,
-    timeframe,
-    limit=250,
-):
+def structure(df):
+    if len(df)<8:return "UNKNOWN"
+    h,l=df.high,df.low
+    hh=h.iloc[-1]>h.iloc[-4]; hl=l.iloc[-1]>l.iloc[-4]
+    lh=h.iloc[-1]<h.iloc[-4]; ll=l.iloc[-1]<l.iloc[-4]
+    if hh and hl:return "HH_HL"
+    if lh and ll:return "LH_LL"
+    if hh or hl:return "BULLISH_BUILD"
+    if lh or ll:return "BEARISH_BUILD"
+    return "RANGE"
+
+def analyze(df):
+    if len(df)<80:return None
+    df=df.copy()
+    df["e20"]=ema(df.close,20); df["e50"]=ema(df.close,50); df["e200"]=ema(df.close,200)
+    df["rsi"]=rsi(df.close); df["atr"]=atr(df); df["macd"],df["msig"],df["mh"]=macd(df.close)
+    df["adx"],df["di+"]=adx(df)[0],adx(df)[1]; df["di-"]=adx(df)[2]
+    df["vma"]=df.volume.rolling(20).mean(); df["vr"]=df.volume/df.vma.replace(0,math.nan)
+    df["hi20"]=df.high.rolling(20).max().shift(1); df["lo20"]=df.low.rolling(20).min().shift(1)
+    df["r1"]=df.close.pct_change()*100; df["r3"]=df.close.pct_change(3)*100; df["r6"]=df.close.pct_change(6)*100
+    df["rng"]=(df.high-df.low).replace(0,math.nan)
+    df["body"]=(df.close-df.open).abs()/df.rng
+    x=df.iloc[-1]; p=df.iloc[-2]
+    bull=bear=0; br=[]; sr=[]
+    if x.close>x.e20:bull+=2;br.append("price>EMA20")
+    else:bear+=2;sr.append("price<EMA20")
+    if x.e20>x.e50:bull+=2;br.append("EMA20>EMA50")
+    else:bear+=2;sr.append("EMA20<EMA50")
+    if x.e50>x.e200:bull+=2;br.append("EMA50>EMA200")
+    else:bear+=2;sr.append("EMA50<EMA200")
+    if x.mh>0 and x.mh>p.mh:bull+=2;br.append("MACD rising")
+    elif x.mh<0 and x.mh<p.mh:bear+=2;sr.append("MACD falling")
+    if x["di+"]>x["di-"] and x.adx>=18:bull+=2
+    elif x["di-"]>x["di+"] and x.adx>=18:bear+=2
+    if x.rsi>=55:bull+=1
+    elif x.rsi<=45:bear+=1
+    if x.close>x.hi20:bull+=2;br.append("fresh breakout")
+    if x.close<x.lo20:bear+=2;sr.append("fresh breakdown")
+    st=structure(df)
+    if st in ("HH_HL","BULLISH_BUILD"):bull+=2;br.append("bullish structure")
+    elif st in ("LH_LL","BEARISH_BUILD"):bear+=2;sr.append("bearish structure")
+    if x.body>=.60:
+        if x.close>x.open:bull+=1
+        else:bear+=1
+    gap=bull-bear
+    direction="BULLISH" if gap>=4 else "BEARISH" if gap<=-4 else "MIXED"
+    return dict(direction=direction,bull=bull,bear=bear,gap=gap,close=f(x.close),
+      e20=f(x.e20),e50=f(x.e50),e200=f(x.e200),rsi=f(x.rsi),atr=f(x.atr),
+      mh=f(x.mh),adx=f(x.adx),dip=f(x["di+"]),dim=f(x["di-"]),vr=f(x.vr,1),
+      r1=f(x.r1),r3=f(x.r3),r6=f(x.r6),breakout=bool(x.close>x.hi20),
+      breakdown=bool(x.close<x.lo20),structure=st,hi20=f(x.hi20),lo20=f(x.lo20),
+      bull_reasons=br,bear_reasons=sr,df=df)
+
+# ========================= NEWS / MACRO =========================
+def feed(xml,source):
+    out=[]
+    try: root=ET.fromstring(xml)
+    except: return out
+    for item in root.iter():
+        if item.tag.lower().split("}")[-1] not in ("item","entry"):continue
+        title=link=pub=""
+        for c in list(item):
+            t=c.tag.lower().split("}")[-1]; txt=(c.text or "").strip()
+            if t=="title":title=txt
+            elif t=="link":link=c.attrib.get("href","") or txt
+            elif t in ("pubdate","published","updated"):pub=txt
+        if title:out.append({"title":html.unescape(re.sub(r"\s+"," ",title)),
+                             "link":link,"published":pub,"source":source})
+    return out
+
+def news():
+    if not ENABLE_NEWS:return []
+    if time.time()-NEWS_CACHE["ts"]<300:return NEWS_CACHE["items"]
+    all=[]
+    for u in RSS:
+        try:all+=feed(get(u,timeout=8).text,u)
+        except Exception as e:print("RSS:",e)
+    uniq={}
+    for x in all:
+        k=re.sub(r"[^a-z0-9]+"," ",x["title"].lower()).strip();uniq[k]=x
+    NEWS_CACHE.update(ts=time.time(),items=list(uniq.values())[:250])
+    return NEWS_CACHE["items"]
+
+def termscore(text,terms):
+    t=text.lower(); s=0; hits=[]
+    for k,v in terms.items():
+        if k in t:s+=v;hits.append(k)
+    return s,hits
+
+def asset_news(sym,items):
+    base=sym.split("/")[0].lower()
+    words=ALIASES.get(base.upper(),[base])
+    found=[]
+    for x in items:
+        if any(w in x["title"].lower() for w in words):
+            ps,ph=termscore(x["title"],POS); ns,nh=termscore(x["title"],NEG)
+            found.append({"title":x["title"],"score":ps+ns,"source":x["source"]})
+    found.sort(key=lambda x:abs(x["score"]),reverse=True);found=found[:5]
+    total=sum(x["score"] for x in found)
+    return {"bias":"POSITIVE" if total>=3 else "NEGATIVE" if total<=-3 else "MIXED" if found else "NONE",
+            "score":clamp(total,-8,8),"items":found}
+
+def macro_news(items):
+    arr=[]
+    for x in items:
+        s,h=termscore(x["title"],MACRO)
+        if s:arr.append({"title":x["title"],"score":s})
+    total=clamp(sum(x["score"] for x in arr),-10,10)
+    arr.sort(key=lambda x:abs(x["score"]),reverse=True)
+    return {"bias":"RISK_POSITIVE" if total>=3 else "RISK_NEGATIVE" if total<=-3 else "MIXED",
+            "score":total,"headlines":arr[:5]}
+
+# ========================= FEAR & GREED / DERIVATIVES =========================
+def fng():
+    if time.time()-FNG_CACHE["ts"]<900:return FNG_CACHE["value"]
     try:
-        ohlcv = exchange.fetch_ohlcv(
-            symbol,
-            timeframe=timeframe,
-            limit=limit,
-        )
-
-        df = candles_to_df(ohlcv)
-
-        if df is None:
-            return None
-
-        if len(df) < 210:
-            return None
-
-        # Last candle can still be forming.
-        return df.iloc[:-1].copy()
-
-    except Exception as e:
-        print(
-            f"Candle error {symbol} {timeframe}:",
-            e,
-        )
-        return None
-
-
-# ============================================================
-# INDICATORS
-# ============================================================
-
-def ema(series, length):
-    return series.ewm(
-        span=length,
-        adjust=False,
-        min_periods=length,
-    ).mean()
-
-
-def rsi(series, length=14):
-    delta = series.diff()
-
-    gain = delta.clip(lower=0)
-    loss = -delta.clip(upper=0)
-
-    avg_gain = gain.ewm(
-        alpha=1 / length,
-        adjust=False,
-        min_periods=length,
-    ).mean()
-
-    avg_loss = loss.ewm(
-        alpha=1 / length,
-        adjust=False,
-        min_periods=length,
-    ).mean()
-
-    rs = avg_gain / avg_loss.replace(0, math.nan)
-
-    result = 100 - (100 / (1 + rs))
-
-    return result.fillna(50)
-
-
-def atr(df, length=14):
-    previous_close = df["close"].shift(1)
-
-    tr1 = df["high"] - df["low"]
-    tr2 = (df["high"] - previous_close).abs()
-    tr3 = (df["low"] - previous_close).abs()
-
-    true_range = pd.concat(
-        [tr1, tr2, tr3],
-        axis=1,
-    ).max(axis=1)
-
-    return true_range.ewm(
-        alpha=1 / length,
-        adjust=False,
-        min_periods=length,
-    ).mean()
-
-
-def macd(series):
-    fast = ema(series, 12)
-    slow = ema(series, 26)
-
-    line = fast - slow
-    signal = ema(line, 9)
-    histogram = line - signal
-
-    return line, signal, histogram
-
-
-def adx(df, length=14):
-    high = df["high"]
-    low = df["low"]
-    close = df["close"]
-
-    up_move = high.diff()
-    down_move = -low.diff()
-
-    plus_dm = pd.Series(
-        0.0,
-        index=df.index,
-    )
-
-    minus_dm = pd.Series(
-        0.0,
-        index=df.index,
-    )
-
-    plus_condition = (
-        (up_move > down_move)
-        & (up_move > 0)
-    )
-
-    minus_condition = (
-        (down_move > up_move)
-        & (down_move > 0)
-    )
-
-    plus_dm.loc[plus_condition] = up_move.loc[
-        plus_condition
-    ]
-
-    minus_dm.loc[minus_condition] = down_move.loc[
-        minus_condition
-    ]
-
-    previous_close = close.shift(1)
-
-    tr1 = high - low
-    tr2 = (high - previous_close).abs()
-    tr3 = (low - previous_close).abs()
-
-    true_range = pd.concat(
-        [tr1, tr2, tr3],
-        axis=1,
-    ).max(axis=1)
-
-    atr_value = true_range.ewm(
-        alpha=1 / length,
-        adjust=False,
-        min_periods=length,
-    ).mean()
-
-    plus_smoothed = plus_dm.ewm(
-        alpha=1 / length,
-        adjust=False,
-        min_periods=length,
-    ).mean()
-
-    minus_smoothed = minus_dm.ewm(
-        alpha=1 / length,
-        adjust=False,
-        min_periods=length,
-    ).mean()
-
-    plus_di = (
-        100
-        * plus_smoothed
-        / atr_value.replace(0, math.nan)
-    )
-
-    minus_di = (
-        100
-        * minus_smoothed
-        / atr_value.replace(0, math.nan)
-    )
-
-    denominator = (
-        plus_di + minus_di
-    ).replace(0, math.nan)
-
-    dx = (
-        100
-        * (plus_di - minus_di).abs()
-        / denominator
-    )
-
-    adx_value = dx.ewm(
-        alpha=1 / length,
-        adjust=False,
-        min_periods=length,
-    ).mean()
-
-    return (
-        adx_value.fillna(0),
-        plus_di.fillna(0),
-        minus_di.fillna(0),
-    )
-
-
-# ============================================================
-# TECHNICAL ENGINE
-# ============================================================
-
-def add_indicators(df):
-    df = df.copy()
-
-    df["ema20"] = ema(
-        df["close"],
-        20,
-    )
-
-    df["ema50"] = ema(
-        df["close"],
-        50,
-    )
-
-    df["ema200"] = ema(
-        df["close"],
-        200,
-    )
-
-    df["rsi"] = rsi(
-        df["close"],
-        14,
-    )
-
-    (
-        df["macd_line"],
-        df["macd_signal"],
-        df["macd_hist"],
-    ) = macd(df["close"])
-
-    (
-        df["adx"],
-        df["plus_di"],
-        df["minus_di"],
-    ) = adx(df, 14)
-
-    df["atr"] = atr(
-        df,
-        14,
-    )
-
-    df["volume_ma"] = (
-        df["volume"]
-        .rolling(20)
-        .mean()
-    )
-
-    df["recent_high"] = (
-        df["high"]
-        .shift(1)
-        .rolling(20)
-        .max()
-    )
-
-    df["recent_low"] = (
-        df["low"]
-        .shift(1)
-        .rolling(20)
-        .min()
-    )
-
-    df["range"] = (
-        df["high"] - df["low"]
-    )
-
-    df["body"] = (
-        df["close"] - df["open"]
-    )
-
-    df["body_ratio"] = (
-        df["body"].abs()
-        / df["range"].replace(0, math.nan)
-    ).fillna(0)
-
-    df = df.dropna().copy()
-
-    return df
-
-
-def analyze_timeframe(
-    raw_df,
-    timeframe,
-):
-    if raw_df is None:
-        return None
-
-    df = add_indicators(raw_df)
-
-    if len(df) < 50:
-        return None
-
-    last = df.iloc[-1]
-    previous = df.iloc[-2]
-
-    bullish = 0.0
-    bearish = 0.0
-
-    bull_reasons = []
-    bear_reasons = []
-
-    close = safe_float(last["close"])
-
-    # -----------------------------
-    # TREND
-    # -----------------------------
-
-    if close > last["ema50"] > last["ema200"]:
-        bullish += 18
-        bull_reasons.append(
-            "Price > EMA50 > EMA200"
-        )
-
-    elif close < last["ema50"] < last["ema200"]:
-        bearish += 18
-        bear_reasons.append(
-            "Price < EMA50 < EMA200"
-        )
-
-    if last["ema20"] > last["ema50"]:
-        bullish += 8
-        bull_reasons.append(
-            "EMA20 above EMA50"
-        )
-
-    elif last["ema20"] < last["ema50"]:
-        bearish += 8
-        bear_reasons.append(
-            "EMA20 below EMA50"
-        )
-
-    # -----------------------------
-    # RSI
-    # -----------------------------
-
-    current_rsi = safe_float(
-        last["rsi"]
-    )
-
-    if 52 <= current_rsi <= 68:
-        bullish += 10
-        bull_reasons.append(
-            f"Healthy bullish RSI ({current_rsi:.1f})"
-        )
-
-    elif 32 <= current_rsi <= 48:
-        bearish += 10
-        bear_reasons.append(
-            f"Healthy bearish RSI ({current_rsi:.1f})"
-        )
-
-    elif 68 < current_rsi <= 75:
-        bullish += 4
-        bull_reasons.append(
-            f"Strong RSI ({current_rsi:.1f})"
-        )
-
-    elif 25 <= current_rsi < 32:
-        bearish += 4
-        bear_reasons.append(
-            f"Weak RSI ({current_rsi:.1f})"
-        )
-
-    elif current_rsi > 78:
-        bearish += 5
-        bear_reasons.append(
-            f"Overextended RSI ({current_rsi:.1f})"
-        )
-
-    elif current_rsi < 22:
-        bullish += 5
-        bull_reasons.append(
-            f"Oversold RSI ({current_rsi:.1f})"
-        )
-
-    # -----------------------------
-    # MACD
-    # -----------------------------
-
-    hist = safe_float(
-        last["macd_hist"]
-    )
-
-    previous_hist = safe_float(
-        previous["macd_hist"]
-    )
-
-    macd_line = safe_float(
-        last["macd_line"]
-    )
-
-    macd_signal = safe_float(
-        last["macd_signal"]
-    )
-
-    if hist > 0 and macd_line > macd_signal:
-        bullish += 10
-        bull_reasons.append(
-            "MACD bullish"
-        )
-
-        if previous_hist <= 0:
-            bullish += 5
-            bull_reasons.append(
-                "Fresh MACD bullish crossover"
-            )
-
-    elif hist < 0 and macd_line < macd_signal:
-        bearish += 10
-        bear_reasons.append(
-            "MACD bearish"
-        )
-
-        if previous_hist >= 0:
-            bearish += 5
-            bear_reasons.append(
-                "Fresh MACD bearish crossover"
-            )
-
-    # -----------------------------
-    # ADX / DI
-    # -----------------------------
-
-    adx_value = safe_float(
-        last["adx"]
-    )
-
-    plus_di = safe_float(
-        last["plus_di"]
-    )
-
-    minus_di = safe_float(
-        last["minus_di"]
-    )
-
-    if adx_value >= MIN_ADX:
-
-        if plus_di > minus_di:
-            bullish += 9
-            bull_reasons.append(
-                f"Directional strength bullish (ADX {adx_value:.1f})"
-            )
-
-        elif minus_di > plus_di:
-            bearish += 9
-            bear_reasons.append(
-                f"Directional strength bearish (ADX {adx_value:.1f})"
-            )
-
-    # -----------------------------
-    # VOLUME
-    # -----------------------------
-
-    volume_ratio = 0.0
-
-    if safe_float(last["volume_ma"]) > 0:
-        volume_ratio = (
-            safe_float(last["volume"])
-            / safe_float(last["volume_ma"])
-        )
-
-    if volume_ratio >= MIN_VOLUME_RATIO:
-
-        if last["close"] > last["open"]:
-            bullish += 7
-            bull_reasons.append(
-                f"Volume confirmation ({volume_ratio:.2f}x)"
-            )
-
-        elif last["close"] < last["open"]:
-            bearish += 7
-            bear_reasons.append(
-                f"Sell-volume confirmation ({volume_ratio:.2f}x)"
-            )
-
-    # -----------------------------
-    # BREAKOUT / BREAKDOWN
-    # -----------------------------
-
-    previous_high = safe_float(
-        df["high"].iloc[-21:-1].max()
-    )
-
-    previous_low = safe_float(
-        df["low"].iloc[-21:-1].min()
-    )
-
-    breakout = close > previous_high
-    breakdown = close < previous_low
-
-    if breakout:
-        bullish += 12
-        bull_reasons.append(
-            "Breakout above recent structure"
-        )
-
-    if breakdown:
-        bearish += 12
-        bear_reasons.append(
-            "Breakdown below recent structure"
-        )
-
-    # -----------------------------
-    # SHORT-TERM STRUCTURE
-    # -----------------------------
-
-    higher_high = (
-        last["high"]
-        > df["high"].iloc[-3]
-    )
-
-    higher_low = (
-        last["low"]
-        > df["low"].iloc[-3]
-    )
-
-    lower_high = (
-        last["high"]
-        < df["high"].iloc[-3]
-    )
-
-    lower_low = (
-        last["low"]
-        < df["low"].iloc[-3]
-    )
-
-    if higher_high and higher_low:
-        bullish += 6
-        bull_reasons.append(
-            "Higher-high / higher-low structure"
-        )
-
-    if lower_high and lower_low:
-        bearish += 6
-        bear_reasons.append(
-            "Lower-high / lower-low structure"
-        )
-
-    # -----------------------------
-    # CANDLE QUALITY
-    # -----------------------------
-
-    body_ratio = safe_float(
-        last["body_ratio"]
-    )
-
-    if body_ratio >= 0.55:
-
-        if last["close"] > last["open"]:
-            bullish += 4
-            bull_reasons.append(
-                "Strong bullish candle body"
-            )
-
-        elif last["close"] < last["open"]:
-            bearish += 4
-            bear_reasons.append(
-                "Strong bearish candle body"
-            )
-
-    # -----------------------------
-    # DIRECTION
-    # -----------------------------
-
-    if bullish >= bearish + 8:
-        direction = "BULLISH"
-
-    elif bearish >= bullish + 8:
-        direction = "BEARISH"
-
+        d=get("https://api.alternative.me/fng/",{"limit":1}).json()["data"][0]
+        FNG_CACHE.update(ts=time.time(),value=(int(d["value"]),d["value_classification"]))
+        return FNG_CACHE["value"]
+    except:return None
+
+def deriv(base):
+    if base in DERIV_CACHE and time.time()-DERIV_CACHE[base][0]<300:return DERIV_CACHE[base][1]
+    o={"funding":None,"oi":None,"available":False}
+    inst=f"{base}-USDT-SWAP"
+    try:
+        z=okx("/api/v5/public/funding-rate",{"instId":inst})
+        if z:o["funding"]=f(z[0].get("fundingRate"));o["available"]=True
+    except:pass
+    try:
+        z=okx("/api/v5/public/open-interest",{"instType":"SWAP","instId":inst})
+        if z:o["oi"]=f(z[0].get("oi"));o["available"]=True
+    except:pass
+    DERIV_CACHE[base]=(time.time(),o);return o
+
+# ========================= REGIME =========================
+def bval(x):return 1 if x and x["direction"]=="BULLISH" else -1 if x and x["direction"]=="BEARISH" else 0
+def btc_regime(a,b,c,macro):
+    base=.25*bval(a)+.35*bval(b)+.40*bval(c)
+    if c["direction"]=="BEARISH" and c["gap"]<=-6:base-=.25
+    if c["direction"]=="BULLISH" and c["gap"]>=6:base+=.20
+    if macro["bias"]=="RISK_NEGATIVE":base-=.10
+    if macro["bias"]=="RISK_POSITIVE":base+=.10
+    down=c["direction"]=="BEARISH" and c["r1"]<=-1.5 and c["vr"]>=1.5
+    up=c["direction"]=="BULLISH" and c["r1"]>=1.5 and c["vr"]>=1.5
+    if down:reg="RISK_OFF"
+    elif up:reg="RISK_ON"
+    elif base>=.45:reg="RISK_ON"
+    elif base<=-.45:reg="RISK_OFF"
+    elif base>=.15:reg="RECOVERY"
+    elif base<=-.15:reg="DISTRIBUTION"
+    else:reg="TRANSITION"
+    return {"regime":reg,"base":round(base,3),"shock_down":down,"shock_up":up}
+
+def breadth(rows):
+    x=[r["h1"] for r in rows if r.get("h1")]
+    if not x:return {"status":"UNKNOWN","value":0,"bull":0,"bear":0}
+    bu=sum(z["direction"]=="BULLISH" for z in x);be=sum(z["direction"]=="BEARISH" for z in x)
+    v=(bu-be)/len(x)
+    return {"status":"BULLISH" if v>=.25 else "BEARISH" if v<=-.25 else "MIXED",
+            "value":round(v,3),"bull":bu,"bear":be}
+
+def rs(a,b):return None if not a or not b or a["r6"] is None or b["r6"] is None else a["r6"]-b["r6"]
+
+# ========================= RISK / SCORE =========================
+def extended(a,b,side):
+    if side=="LONG":
+        if a["e20"] and a["close"]>a["e20"]*1.08:return True,"1H >8% above EMA20"
+        if b["e20"] and b["close"]>b["e20"]*1.18:return True,"4H >18% above EMA20"
     else:
-        direction = "MIXED"
+        if a["e20"] and a["close"]<a["e20"]*.92:return True,"1H >8% below EMA20"
+        if b["e20"] and b["close"]<b["e20"]*.82:return True,"4H >18% below EMA20"
+    return False,""
 
-    # -----------------------------
-    # REVERSAL FLAGS
-    # -----------------------------
-
-    bullish_reversal_risk = False
-    bearish_reversal_risk = False
-
-    if (
-        close < last["ema20"]
-        and last["ema20"] < last["ema50"]
-        and hist < 0
-        and current_rsi < 48
-    ):
-        bullish_reversal_risk = True
-
-    if (
-        close > last["ema20"]
-        and last["ema20"] > last["ema50"]
-        and hist > 0
-        and current_rsi > 52
-    ):
-        bearish_reversal_risk = True
-
-    return {
-        "timeframe": timeframe,
-
-        "bullish": round(
-            clamp(bullish, 0, 100),
-            2,
-        ),
-
-        "bearish": round(
-            clamp(bearish, 0, 100),
-            2,
-        ),
-
-        "direction": direction,
-
-        "bull_reasons": bull_reasons,
-        "bear_reasons": bear_reasons,
-
-        "price": close,
-
-        "atr": safe_float(
-            last["atr"]
-        ),
-
-        "rsi": current_rsi,
-
-        "adx": adx_value,
-
-        "plus_di": plus_di,
-
-        "minus_di": minus_di,
-
-        "volume_ratio": volume_ratio,
-
-        "macd_line": macd_line,
-        "macd_signal": macd_signal,
-        "macd_hist": hist,
-
-        "ema20": safe_float(
-            last["ema20"]
-        ),
-
-        "ema50": safe_float(
-            last["ema50"]
-        ),
-
-        "ema200": safe_float(
-            last["ema200"]
-        ),
-
-        "recent_high": previous_high,
-        "recent_low": previous_low,
-
-        "breakout": breakout,
-        "breakdown": breakdown,
-
-        "higher_high": higher_high,
-        "higher_low": higher_low,
-
-        "lower_high": lower_high,
-        "lower_low": lower_low,
-
-        "body_ratio": body_ratio,
-
-        "bullish_reversal_risk":
-            bullish_reversal_risk,
-
-        "bearish_reversal_risk":
-            bearish_reversal_risk,
-
-        "timestamp": last["timestamp"],
-    }
-
-
-# ============================================================
-# BTC MARKET REGIME
-# ============================================================
-
-def get_btc_market_analysis(exchange):
-    analyses = {}
-
-    for tf in TIMEFRAMES:
-
-        try:
-            df = get_closed_candles(
-                exchange,
-                "BTC/USDT",
-                tf,
-                250,
-            )
-
-            if df is None:
-                continue
-
-            result = analyze_timeframe(
-                df,
-                tf,
-            )
-
-            if result:
-                analyses[tf] = result
-
-        except Exception as e:
-            print(
-                f"BTC {tf} analysis error:",
-                e,
-            )
-
-    if not analyses:
-        return {
-            "regime": "UNKNOWN",
-            "score": 0,
-            "analyses": {},
-        }
-
-    daily = analyses.get("1d")
-    four_h = analyses.get("4h")
-    one_h = analyses.get("1h")
-
-    long_score = 0.0
-    short_score = 0.0
-
-    if daily:
-        long_score += daily["bullish"] * 0.25
-        short_score += daily["bearish"] * 0.25
-
-    if four_h:
-        long_score += four_h["bullish"] * 0.35
-        short_score += four_h["bearish"] * 0.35
-
-    if one_h:
-        long_score += one_h["bullish"] * 0.40
-        short_score += one_h["bearish"] * 0.40
-
-    # Strong 1H reversal can override a bullish higher timeframe.
-    if one_h:
-
-        if (
-            one_h["bearish"] >= 65
-            and one_h["bullish"] + 15
-            < one_h["bearish"]
-        ):
-            short_score += 10
-
-        if (
-            one_h["bullish"] >= 65
-            and one_h["bearish"] + 15
-            < one_h["bullish"]
-        ):
-            long_score += 10
-
-    difference = long_score - short_score
-
-    if long_score >= 65 and difference >= 15:
-        regime = "BULLISH"
-
-    elif short_score >= 65 and difference <= -15:
-        regime = "BEARISH"
-
-    elif (
-        abs(difference) <= 12
-        or (
-            one_h
-            and (
-                one_h["direction"] == "MIXED"
-            )
-        )
-    ):
-        regime = "TRANSITION"
-
+def veto(side,btc,a,b,n,br):
+    reasons=[]
+    if side=="LONG":
+        if btc["regime"]=="RISK_OFF":reasons.append("BTC risk-off")
+        if btc["shock_down"]:reasons.append("BTC downside shock")
+        if br["status"]=="BEARISH":reasons.append("breadth bearish")
+        if a["direction"]=="BEARISH" and a["gap"]<=-6:reasons.append("1H strong bearish")
+        if a["e20"]<a["e50"] and a["mh"]<0 and a["rsi"]<45:reasons.append("1H bearish invalidation")
+        if a["breakdown"] and a["mh"]<0:reasons.append("1H breakdown")
+        if n["bias"]=="NEGATIVE" and n["score"]<=-5:reasons.append("negative catalyst")
     else:
-        regime = "NEUTRAL"
+        if btc["regime"]=="RISK_ON":reasons.append("BTC risk-on")
+        if btc["shock_up"]:reasons.append("BTC upside shock")
+        if br["status"]=="BULLISH":reasons.append("breadth bullish")
+        if a["direction"]=="BULLISH" and a["gap"]>=6:reasons.append("1H strong bullish")
+        if a["e20"]>a["e50"] and a["mh"]>0 and a["rsi"]>55:reasons.append("1H bullish invalidation")
+        if a["breakout"] and a["mh"]>0:reasons.append("1H breakout")
+        if n["bias"]=="POSITIVE" and n["score"]>=5:reasons.append("positive catalyst")
+    hard=any(x in reasons for x in ("BTC downside shock","BTC upside shock","1H bearish invalidation","1H bullish invalidation","1H breakdown","1H breakout"))
+    return hard,reasons
 
-    return {
-        "regime": regime,
-        "long_score": round(
-            long_score,
-            2,
-        ),
-        "short_score": round(
-            short_score,
-            2,
-        ),
-        "score": round(
-            difference,
-            2,
-        ),
-        "analyses": analyses,
-    }
+def score(side,d1,h4,h1,btc,br,rel,d,n,macro,fg):
+    sc=50;ev=[];risk=[]
+    for tf,w,name in ((d1,.20,"1D"),(h4,.30,"4H"),(h1,.35,"1H")):
+        raw=tf["bull"]-tf["bear"]
+        if side=="SHORT":raw=-raw
+        sc+=w*raw/12*100
+        if (side=="LONG" and tf["direction"]=="BULLISH") or (side=="SHORT" and tf["direction"]=="BEARISH"):ev.append(name+" aligned")
+        else:risk.append(name+" conflict")
+    if side=="LONG":
+        if btc["regime"] in ("RISK_ON","RECOVERY"):sc+=14;ev.append("BTC supportive")
+        elif btc["regime"] in ("RISK_OFF","DISTRIBUTION"):sc-=18;risk.append("BTC adverse")
+        if br["status"]=="BULLISH":sc+=8
+        elif br["status"]=="BEARISH":sc-=8
+        if rel is not None:sc+=clamp(rel,-8,8);ev+=["relative strength"] if rel>2 else []
+        if d["funding"] is not None:
+            if d["funding"]<-.0001:sc+=4;ev.append("negative funding")
+            elif d["funding"]>.0005:sc-=5;risk.append("crowded funding")
+        if n["bias"]=="POSITIVE":sc+=10;ev.append("positive catalyst")
+        elif n["bias"]=="NEGATIVE":sc-=10;risk.append("negative catalyst")
+    else:
+        if btc["regime"] in ("RISK_OFF","DISTRIBUTION"):sc+=14;ev.append("BTC supportive")
+        elif btc["regime"] in ("RISK_ON","RECOVERY"):sc-=18;risk.append("BTC adverse")
+        if br["status"]=="BEARISH":sc+=8
+        elif br["status"]=="BULLISH":sc-=8
+        if rel is not None:sc+=clamp(-rel,-8,8);ev+=["relative weakness"] if rel<-2 else []
+        if d["funding"] is not None:
+            if d["funding"]>.0001:sc+=4;ev.append("positive funding")
+            elif d["funding"]<-.0005:sc-=5;risk.append("crowded funding")
+        if n["bias"]=="NEGATIVE":sc+=10;ev.append("negative catalyst")
+        elif n["bias"]=="POSITIVE":sc-=10;risk.append("positive catalyst")
+    if macro["bias"]=="RISK_POSITIVE":sc+=4 if side=="LONG" else -3
+    elif macro["bias"]=="RISK_NEGATIVE":sc+=4 if side=="SHORT" else -5
+    if fg:
+        if side=="LONG" and fg[0]>80:sc-=3
+        if side=="SHORT" and fg[0]<20:sc-=3
+    return int(clamp(round(sc),0,100)),ev,risk
 
+# ========================= EARLY RADAR =========================
+def radar(side,a,b,btc,n,rel):
+    sc=0;why=[]
+    if a["vr"]>=1.8:sc+=20;why.append(f"1H unusual volume ({a['vr']:.2f}x)")
+    if side=="LONG":
+        if a["r1"]>=2:sc+=15;why.append(f"1H acceleration (+{a['r1']:.2f}%)")
+        if a["breakout"]:sc+=20;why.append("fresh 1H breakout")
+        if b["structure"] in ("HH_HL","BULLISH_BUILD"):sc+=15;why.append("4H bullish structure")
+        if a["mh"]>0:sc+=10;why.append("positive MACD")
+        if rel is not None and rel>=2:sc+=8;why.append("relative strength vs BTC")
+        if n["bias"]=="POSITIVE":sc+=10;why.append("positive catalyst")
+        if btc["regime"] in ("RISK_ON","RECOVERY"):sc+=5
+    else:
+        if a["r1"]<=-2:sc+=15;why.append(f"1H downside acceleration ({a['r1']:.2f}%)")
+        if a["breakdown"]:sc+=20;why.append("fresh 1H breakdown")
+        if b["structure"] in ("LH_LL","BEARISH_BUILD"):sc+=15;why.append("4H bearish structure")
+        if a["mh"]<0:sc+=10;why.append("negative MACD")
+        if rel is not None and rel<=-2:sc+=8;why.append("relative weakness vs BTC")
+        if n["bias"]=="NEGATIVE":sc+=10;why.append("negative catalyst")
+        if btc["regime"] in ("RISK_OFF","DISTRIBUTION"):sc+=5
+    ex,reason=extended(a,b,side)
+    return {"score":int(clamp(sc,0,100)),"why":why,"status":"EXTENDED" if ex else "EARLY" if sc>=60 else "NONE","extension":reason}
 
-# ============================================================
-# OKX DERIVATIVES INTELLIGENCE
-# ============================================================
-
-def okx_get(path, params):
+# ========================= COIN ANALYSIS =========================
+def coin(inst,btc_h1,items,macro):
+    sym=inst.replace("-USDT","/USDT")
     try:
-        response = requests.get(
-            f"{OKX_BASE_URL}{path}",
-            params=params,
-            timeout=10,
-        )
+        d1=analyze(candles(inst,"1D",220));h4=analyze(candles(inst,"4H",220));h1=analyze(candles(inst,"1H",260))
+        if not d1 or not h4 or not h1:return {"ok":False,"symbol":sym,"reason":"insufficient data"}
+        n=asset_news(sym,items); di=deriv(sym.split("/")[0]); rel=rs(h1,btc_h1)
+        return {"ok":True,"symbol":sym,"d1":d1,"h4":h4,"h1":h1,"news":n,"deriv":di,"rel":rel}
+    except Exception as e:return {"ok":False,"symbol":sym,"reason":str(e)[:120]}
 
-        if not response.ok:
-            return None
+# ========================= FORMATTING / STATE =========================
+def levels(side,p,at):
+    dist=(at or p*.01)*1.45
+    if side=="LONG":return p-dist,p+dist*1.35,p+dist*2.25,p+dist*3.15
+    return p+dist,p-dist*1.35,p-dist*2.25,p-dist*3.15
 
-        data = response.json()
+def confirmed_msg(c,btc,br,macro,fg):
+    d=c["deriv"];n=c["news"];i="🟢" if c["side"]=="LONG" else "🔴"
+    z=[f"{i} <b>{c['side']} CONFIRMED — V4</b>","━━━━━━━━━━━━━━",
+       f"<b>Coin:</b> {html.escape(c['symbol'])}",f"<b>Model Score:</b> {c['score']}/100",
+       f"<b>Entry:</b> {price(c['entry'])}",f"<b>SL:</b> {price(c['sl'])}",
+       f"<b>TP1:</b> {price(c['tp1'])}",f"<b>TP2:</b> {price(c['tp2'])}",f"<b>TP3:</b> {price(c['tp3'])}",
+       "",f"<b>BTC:</b> {btc['regime']}",f"<b>1D:</b> {c['d1']['direction']} | <b>4H:</b> {c['h4']['direction']} | <b>1H:</b> {c['h1']['direction']}",
+       f"<b>RSI:</b> {c['h1']['rsi']:.1f} | <b>ADX:</b> {c['h1']['adx']:.1f} | <b>Volume:</b> {c['h1']['vr']:.2f}x",
+       f"<b>Breadth:</b> {br['status']} | <b>Macro:</b> {macro['bias']} | <b>News:</b> {n['bias']}"]
+    if c["rel"] is not None:z.append(f"<b>6-candle RS vs BTC:</b> {c['rel']:+.2f}%")
+    if d["funding"] is not None:z.append(f"<b>Funding:</b> {d['funding']*100:.4f}%")
+    z+=["","<b>Evidence:</b>"]+["• "+html.escape(x) for x in c["ev"][:8]]
+    if c["risk"]:z+=["","<b>Risks:</b>"]+["• "+html.escape(x) for x in c["risk"][:5]]
+    z+=["","🧪 <i>Demo / signal-only. No profit guarantee.</i>"]
+    return "\n".join(z)
 
-        if data.get("code") != "0":
-            return None
+def early_msg(r):
+    i="🟢" if r["side"]=="LONG" else "🔴"
+    z=["🚨 <b>POTENTIAL MOVE / EARLY MOMENTUM</b>","━━━━━━━━━━━━━━",
+       f"<b>{html.escape(r['symbol'])}</b> {i} <b>{r['side']}</b>",
+       f"<b>Radar score:</b> {r['score']}/100",f"<b>Price:</b> {price(r['price'])}","",
+       "<b>Why it is on radar:</b>"]+["• "+html.escape(x) for x in r["why"][:7]]
+    z+=["","⚠️ <b>Early watch only — wait for confirmation.</b>"]
+    return "\n".join(z)
 
-        return data.get("data")
+def register(c):
+    k=c["symbol"]+":"+c["side"]
+    ACTIVE[k]={"symbol":c["symbol"],"side":c["side"],"entry":c["entry"],"sl":c["sl"],
+               "tp1":c["tp1"],"tp2":c["tp2"],"tp3":c["tp3"],"created":iso(),
+               "best":c["entry"],"worst":c["entry"],"tp1_hit":False,"tp2_hit":False,"tp3_hit":False}
+    journal("SIGNAL",c)
 
-    except Exception as e:
-        print(
-            "OKX public API error:",
-            path,
-            e,
-        )
-        return None
-
-
-def get_swap_derivatives(base):
-    """
-    Returns:
-        funding_rate
-        open_interest
-        swap_price
-    """
-
-    result = {
-        "available": False,
-        "funding_rate": None,
-        "open_interest": None,
-        "swap_price": None,
-    }
-
-    inst_id = f"{base}-USDT-SWAP"
-
-    # Funding
-    funding_data = okx_get(
-        "/api/v5/public/funding-rate",
-        {
-            "instId": inst_id,
-        },
-    )
-
-    if funding_data:
-
-        funding_rate = safe_float(
-            funding_data[0].get(
-                "fundingRate"
-            ),
-            0,
-        )
-
-        result["funding_rate"] = funding_rate
-
-    # Open interest
-    oi_data = okx_get(
-        "/api/v5/public/open-interest",
-        {
-            "instType": "SWAP",
-            "instId": inst_id,
-        },
-    )
-
-    if oi_data:
-
-        oi = safe_float(
-            oi_data[0].get("oi"),
-            0,
-        )
-
-        result["open_interest"] = oi
-
-    # Swap ticker
-    ticker_data = okx_get(
-        "/api/v5/market/ticker",
-        {
-            "instId": inst_id,
-        },
-    )
-
-    if ticker_data:
-
-        result["swap_price"] = safe_float(
-            ticker_data[0].get("last"),
-            0,
-        )
-
-    if any(
-        value is not None
-        for value in [
-            result["funding_rate"],
-            result["open_interest"],
-            result["swap_price"],
-        ]
-    ):
-        result["available"] = True
-
-    return result
-
-
-def evaluate_derivatives(
-    derivatives,
-    side,
-):
-    """
-    Funding is used as a warning/confirmation signal,
-    not as a standalone trade trigger.
-    """
-
-    if not derivatives:
-        return 0, []
-
-    if not derivatives.get("available"):
-        return 0, []
-
-    funding = derivatives.get(
-        "funding_rate"
-    )
-
-    score = 0
-    reasons = []
-
-    if funding is None:
-        return 0, []
-
-    funding_pct = funding * 100
-
-    if side == "LONG":
-
-        # Positive funding means longs are paying.
-        # Extremely positive funding can mean crowded longs.
-        if 0 <= funding_pct <= 0.03:
-            score += 3
-            reasons.append(
-                f"Funding neutral/healthy ({funding_pct:.3f}%)"
-            )
-
-        elif funding_pct > 0.08:
-            score -= 6
-            reasons.append(
-                f"Crowded long funding ({funding_pct:.3f}%)"
-            )
-
-        elif funding_pct < -0.03:
-            score += 4
-            reasons.append(
-                f"Negative funding supports squeeze risk ({funding_pct:.3f}%)"
-            )
-
-    elif side == "SHORT":
-
-        if -0.03 <= funding_pct <= 0:
-            score += 3
-            reasons.append(
-                f"Funding neutral/healthy ({funding_pct:.3f}%)"
-            )
-
-        elif funding_pct < -0.08:
-            score -= 6
-            reasons.append(
-                f"Crowded short funding ({funding_pct:.3f}%)"
-            )
-
-        elif funding_pct > 0.03:
-            score += 4
-            reasons.append(
-                f"Positive funding supports short squeeze/reversal risk ({funding_pct:.3f}%)"
-            )
-
-    return score, reasons
-
-
-# ============================================================
-# RELATIVE STRENGTH
-# ============================================================
-
-def get_relative_strength(
-    coin_df,
-    btc_df,
-):
-    try:
-        if len(coin_df) < 25:
-            return 0, "Unavailable"
-
-        if len(btc_df) < 25:
-            return 0, "Unavailable"
-
-        coin_return = pct_change(
-            coin_df["close"].iloc[-6],
-            coin_df["close"].iloc[-1],
-        )
-
-        btc_return = pct_change(
-            btc_df["close"].iloc[-6],
-            btc_df["close"].iloc[-1],
-        )
-
-        relative = coin_return - btc_return
-
-        if relative >= 4:
-            return 6, f"Strong relative strength vs BTC ({relative:+.2f}%)"
-
-        if relative >= 2:
-            return 4, f"Relative strength vs BTC ({relative:+.2f}%)"
-
-        if relative <= -4:
-            return -6, f"Weak relative strength vs BTC ({relative:+.2f}%)"
-
-        if relative <= -2:
-            return -4, f"Weak relative strength vs BTC ({relative:+.2f}%)"
-
-        return 0, f"Neutral relative strength ({relative:+.2f}%)"
-
-    except Exception:
-        return 0, "Relative strength unavailable"
-
-
-# ============================================================
-# MARKET BREADTH
-# ============================================================
-
-def calculate_market_breadth(
-    exchange,
-    symbols,
-    max_check=30,
-):
-    bullish = 0
-    bearish = 0
-    checked = 0
-
-    for symbol in symbols[:max_check]:
-
+def cleanup():
+    for k in list(ACTIVE):
+        s=ACTIVE[k]
         try:
-            df = get_closed_candles(
-                exchange,
-                symbol,
-                "1h",
-                80,
-            )
-
-            if df is None:
-                continue
-
-            if len(df) < 30:
-                continue
-
-            close = safe_float(
-                df["close"].iloc[-1]
-            )
-
-            ema20_value = safe_float(
-                ema(
-                    df["close"],
-                    20,
-                ).iloc[-1]
-            )
-
-            if close > ema20_value:
-                bullish += 1
+            df=candles(s["symbol"].replace("/","-"),"1H",5)
+            x=df.iloc[-1];hi=float(x.high);lo=float(x.low)
+            out=None
+            if s["side"]=="LONG":
+                s["best"]=max(s["best"],hi);s["worst"]=min(s["worst"],lo)
+                if lo<=s["sl"]:out="SL"
+                elif hi>=s["tp3"]:out="TP3"
+                elif hi>=s["tp2"]:s["tp1_hit"]=s["tp2_hit"]=True
+                elif hi>=s["tp1"]:s["tp1_hit"]=True
             else:
-                bearish += 1
-
-            checked += 1
-
-        except Exception:
-            continue
-
-    if checked == 0:
-        return {
-            "bullish": 0,
-            "bearish": 0,
-            "breadth": 0,
-            "status": "UNKNOWN",
-        }
-
-    breadth = (
-        (bullish - bearish)
-        / checked
-        * 100
-    )
-
-    if breadth >= 25:
-        status = "POSITIVE"
-
-    elif breadth <= -25:
-        status = "NEGATIVE"
-
-    else:
-        status = "MIXED"
-
-    return {
-        "bullish": bullish,
-        "bearish": bearish,
-        "breadth": round(
-            breadth,
-            2,
-        ),
-        "status": status,
-    }
-
-
-# ============================================================
-# COIN UNIVERSE
-# ============================================================
-
-def get_top_coins(exchange):
-    """
-    Gets a broad USDT spot universe.
-
-    We do NOT silently discard everything outside the old TOP 30.
-    We rank the exchange universe by 24h quote volume and scan
-    a larger set.
-    """
-
-    try:
-        markets = exchange.load_markets()
-
-        tickers = exchange.fetch_tickers()
-
-        candidates = []
-
-        available_count = 0
-
-        for symbol, market in markets.items():
-
-            if not market.get("spot"):
-                continue
-
-            if not market.get("active", True):
-                continue
-
-            if not symbol.endswith("/USDT"):
-                continue
-
-            base = market.get(
-                "base",
-                "",
-            )
-
-            if not base:
-                continue
-
-            if base.upper() in STABLE_BASES:
-                continue
-
-            upper_base = base.upper()
-
-            if any(
-                word in upper_base
-                for word in LEVERAGED_WORDS
-            ):
-                continue
-
-            available_count += 1
-
-            ticker = tickers.get(symbol)
-
-            if not ticker:
-                continue
-
-            quote_volume = safe_float(
-                ticker.get("quoteVolume")
-            )
-
-            last_price = safe_float(
-                ticker.get("last")
-            )
-
-            if quote_volume <= 0:
-                continue
-
-            if last_price <= 0:
-                continue
-
-            candidates.append(
-                {
-                    "symbol": symbol,
-                    "base": base,
-                    "quote_volume": quote_volume,
-                    "last": last_price,
-                }
-            )
-
-        candidates.sort(
-            key=lambda x: x["quote_volume"],
-            reverse=True,
-        )
-
-        selected = candidates[
-            :MAX_UNIVERSE
-        ]
-
-        return (
-            selected,
-            available_count,
-        )
-
-    except Exception as e:
-        print(
-            "Universe error:",
-            e,
-        )
-
-        return [], 0
-
-
-# ============================================================
-# COOLDOWN
-# ============================================================
-
-def signal_key(signal):
-    return (
-        f"{signal['symbol']}|"
-        f"{signal['side']}|"
-        f"{signal['candle_time']}"
-    )
-
-
-def has_active_same_coin(symbol):
-    return symbol in active_signals
-
-
-def is_on_cooldown(
-    symbol,
-    side,
-):
-    key = f"{symbol}|{side}"
-
-    data = cooldowns.get(key)
-
-    if not data:
-        return False
-
-    try:
-        until = datetime.fromisoformat(
-            data["until"]
-        )
-
-        if now_utc() < until:
-            return True
-
-        del cooldowns[key]
-
-        return False
-
-    except Exception:
-        return False
-
-
-def set_cooldown(
-    symbol,
-    side,
-    reason,
-    hours=COOLDOWN_HOURS_AFTER_SL,
-):
-    key = f"{symbol}|{side}"
-
-    until = (
-        now_utc()
-        + timedelta(hours=hours)
-    )
-
-    cooldowns[key] = {
-        "until": until.isoformat(),
-        "reason": reason,
-    }
-
-
-# ============================================================
-# ACTIVE SIGNAL MANAGEMENT
-# ============================================================
-
-def remember_signal(signal):
-    active_signals[
-        signal["symbol"]
-    ] = {
-        "symbol": signal["symbol"],
-        "side": signal["side"],
-        "entry": signal["entry"],
-        "sl": signal["sl"],
-        "tp1": signal["tp1"],
-        "tp2": signal["tp2"],
-        "tp3": signal["tp3"],
-        "created_at": signal["created_at"],
-        "candle_time": signal["candle_time"],
-        "tp1_hit": False,
-        "tp2_hit": False,
-        "tp3_hit": False,
-        "sl_hit": False,
-        "result": "ACTIVE",
-        "max_favorable": 0.0,
-        "max_adverse": 0.0,
-    }
-
-    journal_event(
-        {
-            "event": "SIGNAL_CREATED",
-            "symbol": signal["symbol"],
-            "side": signal["side"],
-            "entry": signal["entry"],
-            "sl": signal["sl"],
-            "tp1": signal["tp1"],
-            "tp2": signal["tp2"],
-            "tp3": signal["tp3"],
-            "score": signal["score"],
-            "created_at": signal["created_at"],
-        }
-    )
-
-
-def check_signal_with_candles(
-    exchange,
-    data,
-):
-    symbol = data["symbol"]
-    side = data["side"]
-
-    try:
-        df = get_closed_candles(
-            exchange,
-            symbol,
-            "1h",
-            100,
-        )
-
-        if df is None:
-            return
-
-        entry = safe_float(
-            data["entry"]
-        )
-
-        sl = safe_float(
-            data["sl"]
-        )
-
-        tp1 = safe_float(
-            data["tp1"]
-        )
-
-        tp2 = safe_float(
-            data["tp2"]
-        )
-
-        tp3 = safe_float(
-            data["tp3"]
-        )
-
-        created_at = datetime.fromisoformat(
-            data["created_at"]
-        )
-
-        # Only inspect candles after signal creation.
-        recent = df[
-            df["timestamp"]
-            > created_at
-        ].copy()
-
-        if recent.empty:
-            return
-
-        for _, candle in recent.iterrows():
-
-            high = safe_float(
-                candle["high"]
-            )
-
-            low = safe_float(
-                candle["low"]
-            )
-
-            if side == "LONG":
-
-                favorable = (
-                    (high - entry)
-                    / entry
-                    * 100
-                )
-
-                adverse = (
-                    (entry - low)
-                    / entry
-                    * 100
-                )
-
-                data["max_favorable"] = max(
-                    data["max_favorable"],
-                    favorable,
-                )
-
-                data["max_adverse"] = max(
-                    data["max_adverse"],
-                    adverse,
-                )
-
-                # Conservative rule:
-                # if SL and TP occur in same candle,
-                # treat SL as first because intrabar ordering
-                # is unknown.
-                if low <= sl:
-                    data["sl_hit"] = True
-                    data["result"] = "SL"
-
-                    journal_event(
-                        {
-                            "event": "SL_HIT",
-                            "symbol": symbol,
-                            "side": side,
-                            "price": sl,
-                        }
-                    )
-
-                    set_cooldown(
-                        symbol,
-                        side,
-                        "SL hit",
-                    )
-
-                    del active_signals[
-                        symbol
-                    ]
-
-                    return
-
-                if high >= tp1:
-                    data["tp1_hit"] = True
-
-                if high >= tp2:
-                    data["tp2_hit"] = True
-
-                if high >= tp3:
-                    data["tp3_hit"] = True
-                    data["result"] = "TP3"
-
-                    journal_event(
-                        {
-                            "event": "TP3_HIT",
-                            "symbol": symbol,
-                            "side": side,
-                            "price": tp3,
-                        }
-                    )
-
-                    del active_signals[
-                        symbol
-                    ]
-
-                    return
-
-            else:
-
-                favorable = (
-                    (entry - low)
-                    / entry
-                    * 100
-                )
-
-                adverse = (
-                    (high - entry)
-                    / entry
-                    * 100
-                )
-
-                data["max_favorable"] = max(
-                    data["max_favorable"],
-                    favorable,
-                )
-
-                data["max_adverse"] = max(
-                    data["max_adverse"],
-                    adverse,
-                )
-
-                if high >= sl:
-                    data["sl_hit"] = True
-                    data["result"] = "SL"
-
-                    journal_event(
-                        {
-                            "event": "SL_HIT",
-                            "symbol": symbol,
-                            "side": side,
-                            "price": sl,
-                        }
-                    )
-
-                    set_cooldown(
-                        symbol,
-                        side,
-                        "SL hit",
-                    )
-
-                    del active_signals[
-                        symbol
-                    ]
-
-                    return
-
-                if low <= tp1:
-                    data["tp1_hit"] = True
-
-                if low <= tp2:
-                    data["tp2_hit"] = True
-
-                if low <= tp3:
-                    data["tp3_hit"] = True
-                    data["result"] = "TP3"
-
-                    journal_event(
-                        {
-                            "event": "TP3_HIT",
-                            "symbol": symbol,
-                            "side": side,
-                            "price": tp3,
-                        }
-                    )
-
-                    del active_signals[
-                        symbol
-                    ]
-
-                    return
-
-        # Timeout after 24h.
-        age = now_utc() - created_at
-
-        if age.total_seconds() >= 24 * 3600:
-
-            data["result"] = "TIMEOUT"
-
-            journal_event(
-                {
-                    "event": "TIMEOUT",
-                    "symbol": symbol,
-                    "side": side,
-                    "tp1_hit": data["tp1_hit"],
-                    "tp2_hit": data["tp2_hit"],
-                    "tp3_hit": data["tp3_hit"],
-                    "max_favorable": data[
-                        "max_favorable"
-                    ],
-                    "max_adverse": data[
-                        "max_adverse"
-                    ],
-                }
-            )
-
-            del active_signals[
-                symbol
-            ]
-
-    except Exception as e:
-        print(
-            f"Signal tracking error {symbol}:",
-            e,
-        )
-
-
-def cleanup_active_signals(exchange):
-    for symbol in list(
-        active_signals.keys()
-    ):
-
-        data = active_signals.get(
-            symbol
-        )
-
-        if not data:
-            continue
-
-        check_signal_with_candles(
-            exchange,
-            data,
-        )
-
-
-# ============================================================
-# 1H REVERSAL / INVALIDATION
-# ============================================================
-
-def long_hard_invalidated(
-    one_h,
-):
-    if not one_h:
-        return True
-
-    # Strong bearish 1H reversal.
-    if (
-        one_h["bearish"] >= 68
-        and one_h["bearish"]
-        >= one_h["bullish"] + 15
-    ):
-        return True
-
-    # Price loses EMA20 + EMA50 with bearish momentum.
-    if (
-        one_h["price"] < one_h["ema20"]
-        and one_h["price"] < one_h["ema50"]
-        and one_h["macd_hist"] < 0
-        and one_h["rsi"] < 47
-    ):
-        return True
-
-    # Structure breakdown.
-    if (
-        one_h["breakdown"]
-        and one_h["macd_hist"] < 0
-    ):
-        return True
-
-    return False
-
-
-def short_hard_invalidated(
-    one_h,
-):
-    if not one_h:
-        return True
-
-    if (
-        one_h["bullish"] >= 68
-        and one_h["bullish"]
-        >= one_h["bearish"] + 15
-    ):
-        return True
-
-    if (
-        one_h["price"] > one_h["ema20"]
-        and one_h["price"] > one_h["ema50"]
-        and one_h["macd_hist"] > 0
-        and one_h["rsi"] > 53
-    ):
-        return True
-
-    if (
-        one_h["breakout"]
-        and one_h["macd_hist"] > 0
-    ):
-        return True
-
-    return False
-
-
-# ============================================================
-# SCORE ENGINE
-# ============================================================
-
-def calculate_side_score(
-    analyses,
-    side,
-    btc_market,
-    breadth,
-    derivatives=None,
-    relative_score=0,
-    relative_reason="",
-):
-    daily = analyses.get("1d")
-    four_h = analyses.get("4h")
-    one_h = analyses.get("1h")
-
-    if not daily or not four_h or not one_h:
-        return {
-            "score": 0,
-            "reasons": [
-                "Incomplete timeframe data"
-            ],
-            "veto": True,
-        }
-
-    if side == "LONG":
-
-        base = (
-            daily["bullish"] * 0.25
-            + four_h["bullish"] * 0.35
-            + one_h["bullish"] * 0.40
-        )
-
-        reasons = []
-
-        if daily["bullish"] >= 55:
-            reasons.append(
-                "1D bullish context"
-            )
-
-        if four_h["bullish"] >= 55:
-            reasons.append(
-                "4H bullish structure"
-            )
-
-        if one_h["bullish"] >= 55:
-            reasons.append(
-                "1H bullish momentum"
-            )
-
-        modifier = 0
-
-        # BTC regime.
-        regime = btc_market["regime"]
-
-        if regime == "BULLISH":
-            modifier += 7
-            reasons.append(
-                "BTC regime aligned bullish"
-            )
-
-        elif regime == "BEARISH":
-            modifier -= 12
-            reasons.append(
-                "BTC regime bearish"
-            )
-
-        elif regime == "TRANSITION":
-            modifier -= 2
-            reasons.append(
-                "BTC regime transition"
-            )
-
-        # Breadth.
-        if breadth["status"] == "POSITIVE":
-            modifier += 4
-            reasons.append(
-                "Market breadth positive"
-            )
-
-        elif breadth["status"] == "NEGATIVE":
-            modifier -= 5
-            reasons.append(
-                "Market breadth negative"
-            )
-
-        # Relative strength.
-        modifier += relative_score
-
-        if relative_reason:
-            reasons.append(
-                relative_reason
-            )
-
-        # Derivatives.
-        deriv_score, deriv_reasons = (
-            evaluate_derivatives(
-                derivatives,
-                "LONG",
-            )
-        )
-
-        modifier += deriv_score
-        reasons.extend(
-            deriv_reasons
-        )
-
-        score = clamp(
-            base + modifier,
-            0,
-            100,
-        )
-
-        veto = long_hard_invalidated(
-            one_h
-        )
-
-        if veto:
-            reasons.append(
-                "1H bearish reversal veto"
-            )
-
-        return {
-            "score": round(score, 2),
-            "base": round(base, 2),
-            "modifier": round(
-                modifier,
-                2,
-            ),
-            "reasons": reasons,
-            "veto": veto,
-        }
-
-    # SHORT
-    base = (
-        daily["bearish"] * 0.25
-        + four_h["bearish"] * 0.35
-        + one_h["bearish"] * 0.40
-    )
-
-    reasons = []
-
-    if daily["bearish"] >= 55:
-        reasons.append(
-            "1D bearish context"
-        )
-
-    if four_h["bearish"] >= 55:
-        reasons.append(
-            "4H bearish structure"
-        )
-
-    if one_h["bearish"] >= 55:
-        reasons.append(
-            "1H bearish momentum"
-        )
-
-    modifier = 0
-
-    regime = btc_market["regime"]
-
-    if regime == "BEARISH":
-        modifier += 7
-        reasons.append(
-            "BTC regime aligned bearish"
-        )
-
-    elif regime == "BULLISH":
-        modifier -= 12
-        reasons.append(
-            "BTC regime bullish"
-        )
-
-    elif regime == "TRANSITION":
-        modifier -= 2
-        reasons.append(
-            "BTC regime transition"
-        )
-
-    if breadth["status"] == "NEGATIVE":
-        modifier += 4
-        reasons.append(
-            "Market breadth negative"
-        )
-
-    elif breadth["status"] == "POSITIVE":
-        modifier -= 5
-        reasons.append(
-            "Market breadth positive"
-        )
-
-    # For SHORT, weak relative strength is positive.
-    modifier -= relative_score
-
-    if relative_reason:
-        reasons.append(
-            relative_reason
-        )
-
-    deriv_score, deriv_reasons = (
-        evaluate_derivatives(
-            derivatives,
-            "SHORT",
-        )
-    )
-
-    modifier += deriv_score
-    reasons.extend(
-        deriv_reasons
-    )
-
-    score = clamp(
-        base + modifier,
-        0,
-        100,
-    )
-
-    veto = short_hard_invalidated(
-        one_h
-    )
-
-    if veto:
-        reasons.append(
-            "1H bullish reversal veto"
-        )
-
-    return {
-        "score": round(score, 2),
-        "base": round(base, 2),
-        "modifier": round(
-            modifier,
-            2,
-        ),
-        "reasons": reasons,
-        "veto": veto,
-    }
-
-
-# ============================================================
-# EARLY MOMENTUM RADAR
-# ============================================================
-
-def detect_early_momentum(
-    symbol,
-    analyses,
-    btc_market,
-):
-    one_h = analyses.get("1h")
-    four_h = analyses.get("4h")
-
-    if not one_h or not four_h:
-        return None
-
-    score = 0
-    reasons = []
-
-    # 1H volume expansion.
-    if one_h["volume_ratio"] >= EARLY_VOLUME_RATIO:
-        score += 18
-        reasons.append(
-            f"1H unusual volume ({one_h['volume_ratio']:.2f}x)"
-        )
-
-    # 1H price acceleration.
-    if one_h["price"] > 0:
-
-        if one_h["bullish"] > one_h["bearish"]:
-            move = 0
-
-            # We approximate using EMA20 distance.
-            move = pct_change(
-                one_h["ema20"],
-                one_h["price"],
-            )
-
-            if move >= EARLY_1H_MOVE:
-                score += 16
-                reasons.append(
-                    f"Strong 1H price acceleration ({move:+.2f}%)"
-                )
-
-        elif one_h["bearish"] > one_h["bullish"]:
-
-            move = pct_change(
-                one_h["ema20"],
-                one_h["price"],
-            )
-
-            if move <= -EARLY_1H_MOVE:
-                score += 16
-                reasons.append(
-                    f"Strong 1H downside acceleration ({move:+.2f}%)"
-                )
-
-    # Structure break.
-    if one_h["breakout"]:
-        score += 20
-        reasons.append(
-            "Fresh 1H breakout"
-        )
-
-    if one_h["breakdown"]:
-        score += 20
-        reasons.append(
-            "Fresh 1H breakdown"
-        )
-
-    # 4H confirmation.
-    if four_h["bullish"] >= 55:
-        score += 10
-        reasons.append(
-            "4H bullish structure building"
-        )
-
-    if four_h["bearish"] >= 55:
-        score += 10
-        reasons.append(
-            "4H bearish structure building"
-        )
-
-    # MACD acceleration.
-    if one_h["macd_hist"] > 0:
-        score += 8
-        reasons.append(
-            "Positive MACD momentum"
-        )
-
-    elif one_h["macd_hist"] < 0:
-        score += 8
-        reasons.append(
-            "Negative MACD momentum"
-        )
-
-    # BTC transition can actually be interesting for
-    # individual coin breakouts, but don't chase against
-    # strong BTC reversal.
-    if btc_market["regime"] == "TRANSITION":
-        score += 3
-        reasons.append(
-            "BTC transition regime"
-        )
-
-    # Avoid extremely weak/no-volume setups.
-    if (
-        one_h["volume_ratio"] < 1.25
-        and not one_h["breakout"]
-        and not one_h["breakdown"]
-    ):
-        return None
-
-    if score < MIN_EARLY_SCORE:
-        return None
-
-    if (
-        one_h["bullish"]
-        > one_h["bearish"]
-    ):
-        side = "LONG"
-    elif (
-        one_h["bearish"]
-        > one_h["bullish"]
-    ):
-        side = "SHORT"
-    else:
-        return None
-
-    return {
-        "symbol": symbol,
-        "side": side,
-        "score": round(
-            clamp(score, 0, 100),
-            2,
-        ),
-        "reasons": reasons[:7],
-        "price": one_h["price"],
-        "timestamp": one_h["timestamp"],
-    }
-
-
-# ============================================================
-# EXTENSION / CHASING FILTER
-# ============================================================
-
-def is_overextended(
-    analyses,
-    side,
-):
-    one_h = analyses.get("1h")
-    four_h = analyses.get("4h")
-
-    if not one_h or not four_h:
-        return True
-
-    one_h_move = pct_change(
-        one_h["ema20"],
-        one_h["price"],
-    )
-
-    four_h_move = pct_change(
-        four_h["ema20"],
-        four_h["price"],
-    )
-
-    if side == "LONG":
-
-        if (
-            one_h_move
-            > MAX_1H_EXTENSION_FOR_NORMAL_ENTRY
-        ):
-            return True
-
-        if (
-            four_h_move
-            > MAX_4H_EXTENSION_FOR_NORMAL_ENTRY
-        ):
-            return True
-
-    else:
-
-        if (
-            one_h_move
-            < -MAX_1H_EXTENSION_FOR_NORMAL_ENTRY
-        ):
-            return True
-
-        if (
-            four_h_move
-            < -MAX_4H_EXTENSION_FOR_NORMAL_ENTRY
-        ):
-            return True
-
-    return False
-
-
-# ============================================================
-# SIGNAL BUILDERS
-# ============================================================
-
-def make_signal(
-    symbol,
-    side,
-    score_data,
-    analyses,
-    btc_market,
-    fg_value,
-    fg_text,
-    derivatives,
-    relative_reason,
-):
-    one_h = analyses["1h"]
-
-    price = safe_float(
-        one_h["price"]
-    )
-
-    atr_value = safe_float(
-        one_h["atr"]
-    )
-
-    if atr_value <= 0:
-        return None
-
-    # ATR-based risk.
-    risk_distance = atr_value * 1.45
-
-    if side == "LONG":
-
-        entry = price
-
-        sl = entry - risk_distance
-
-        risk = entry - sl
-
-        tp1 = entry + risk * 1.35
-        tp2 = entry + risk * 2.25
-        tp3 = entry + risk * 3.15
-
-    else:
-
-        entry = price
-
-        sl = entry + risk_distance
-
-        risk = sl - entry
-
-        tp1 = entry - risk * 1.35
-        tp2 = entry - risk * 2.25
-        tp3 = entry - risk * 3.15
-
-    if risk <= 0:
-        return None
-
-    reasons = list(
-        score_data["reasons"]
-    )
-
-    # Add actual technical evidence.
-    if side == "LONG":
-        reasons.extend(
-            analyses["1h"]["bull_reasons"][:4]
-        )
-    else:
-        reasons.extend(
-            analyses["1h"]["bear_reasons"][:4]
-        )
-
-    if relative_reason:
-        reasons.append(
-            relative_reason
-        )
-
-    if derivatives.get("available"):
-        funding = derivatives.get(
-            "funding_rate"
-        )
-
-        if funding is not None:
-            reasons.append(
-                f"Perp funding {funding * 100:+.3f}%"
-            )
-
-    if fg_value is not None:
-        reasons.append(
-            f"Fear & Greed {fg_value} ({fg_text})"
-        )
-
-    return {
-        "symbol": symbol,
-        "side": side,
-
-        "score": round(
-            score_data["score"],
-            2,
-        ),
-
-        "entry": entry,
-        "sl": sl,
-        "tp1": tp1,
-        "tp2": tp2,
-        "tp3": tp3,
-
-        "risk_pct": (
-            risk / entry * 100
-        ),
-
-        "btc_regime":
-            btc_market["regime"],
-
-        "fg_value":
-            fg_value,
-
-        "fg_text":
-            fg_text,
-
-        "timeframes": {
-            "1D": analyses["1d"]["direction"],
-            "4H": analyses["4h"]["direction"],
-            "1H": analyses["1h"]["direction"],
-        },
-
-        "technical": {
-            "1d_bull":
-                analyses["1d"]["bullish"],
-            "1d_bear":
-                analyses["1d"]["bearish"],
-
-            "4h_bull":
-                analyses["4h"]["bullish"],
-            "4h_bear":
-                analyses["4h"]["bearish"],
-
-            "1h_bull":
-                analyses["1h"]["bullish"],
-            "1h_bear":
-                analyses["1h"]["bearish"],
-
-            "rsi":
-                analyses["1h"]["rsi"],
-
-            "adx":
-                analyses["1h"]["adx"],
-
-            "volume_ratio":
-                analyses["1h"]["volume_ratio"],
-        },
-
-        "derivatives":
-            derivatives,
-
-        "reasons":
-            list(dict.fromkeys(reasons))[:10],
-
-        "created_at":
-            now_utc().isoformat(),
-
-        "candle_time":
-            analyses["1h"]["timestamp"].isoformat(),
-
-        "signal_type":
-            "CONFIRMED",
-    }
-
-
-# ============================================================
-# SIGNAL FORMAT
-# ============================================================
-
-def format_signal(signal):
-    side = signal["side"]
-
-    if side == "LONG":
-        emoji = "🟢"
-        title = "LONG"
-    else:
-        emoji = "🔴"
-        title = "SHORT"
-
-    reasons = ""
-
-    for reason in signal["reasons"][:8]:
-        reasons += (
-            f"• {html.escape(str(reason))}\n"
-        )
-
-    return (
-        f"{emoji} <b>{title} CONFIRMED</b>\n"
-        f"━━━━━━━━━━━━━━\n"
-        f"<b>Coin:</b> {html.escape(signal['symbol'])}\n"
-        f"<b>Confluence:</b> {signal['score']:.0f}/100\n\n"
-
-        f"<b>Entry:</b> {format_price(signal['entry'])}\n"
-        f"<b>Stop Loss:</b> {format_price(signal['sl'])}\n"
-        f"<b>TP1:</b> {format_price(signal['tp1'])}\n"
-        f"<b>TP2:</b> {format_price(signal['tp2'])}\n"
-        f"<b>TP3:</b> {format_price(signal['tp3'])}\n\n"
-
-        f"<b>1D:</b> {signal['timeframes']['1D']}\n"
-        f"<b>4H:</b> {signal['timeframes']['4H']}\n"
-        f"<b>1H:</b> {signal['timeframes']['1H']}\n"
-        f"<b>BTC:</b> {signal['btc_regime']}\n"
-        f"<b>RSI:</b> {signal['technical']['rsi']:.1f}\n"
-        f"<b>ADX:</b> {signal['technical']['adx']:.1f}\n"
-        f"<b>Volume:</b> {signal['technical']['volume_ratio']:.2f}x\n\n"
-
-        f"<b>Evidence:</b>\n"
-        f"{reasons}\n"
-
-        f"⚠️ <i>Demo/test signal. No profit guarantee.</i>"
-    )
-
-
-def format_early_alert(alert):
-    side_emoji = (
-        "🟢"
-        if alert["side"] == "LONG"
-        else "🔴"
-    )
-
-    reasons = ""
-
-    for reason in alert["reasons"]:
-        reasons += (
-            f"• {html.escape(str(reason))}\n"
-        )
-
-    return (
-        f"🚨 <b>POTENTIAL MOVE / EARLY MOMENTUM</b>\n"
-        f"━━━━━━━━━━━━━━\n"
-        f"<b>{html.escape(alert['symbol'])}</b> "
-        f"{side_emoji} <b>{alert['side']}</b>\n"
-        f"<b>Radar score:</b> {alert['score']:.0f}/100\n"
-        f"<b>Price:</b> {format_price(alert['price'])}\n\n"
-        f"<b>Why it is on radar:</b>\n"
-        f"{reasons}\n"
-        f"⚠️ <i>Early watch only — wait for confirmation.</i>"
-    )
-
-
-# ============================================================
-# BUILD / ANALYZE ONE COIN
-# ============================================================
-
-def analyze_coin(
-    exchange,
-    symbol,
-    btc_market,
-    btc_1h_df,
-    breadth,
-    fg_value,
-    fg_text,
-):
-    analyses = {}
-
-    for tf in TIMEFRAMES:
-
-        df = get_closed_candles(
-            exchange,
-            symbol,
-            tf,
-            250,
-        )
-
-        if df is None:
-            return {
-                "status": "REJECTED",
-                "reason": f"Missing {tf} data",
-            }
-
-        result = analyze_timeframe(
-            df,
-            tf,
-        )
-
-        if result is None:
-            return {
-                "status": "REJECTED",
-                "reason": f"Unable to analyze {tf}",
-            }
-
-        analyses[tf] = result
-
-    # Relative strength against BTC.
-    coin_1h_df = get_closed_candles(
-        exchange,
-        symbol,
-        "1h",
-        80,
-    )
-
-    relative_score, relative_reason = (
-        get_relative_strength(
-            coin_1h_df,
-            btc_1h_df,
-        )
-    )
-
-    # Derivatives are fetched for stronger technical
-    # candidates only later in the scanner.
-    derivatives = {}
-
-    long_data = calculate_side_score(
-        analyses,
-        "LONG",
-        btc_market,
-        breadth,
-        derivatives,
-        relative_score,
-        relative_reason,
-    )
-
-    short_data = calculate_side_score(
-        analyses,
-        "SHORT",
-        btc_market,
-        breadth,
-        derivatives,
-        relative_score,
-        relative_reason,
-    )
-
-    early = detect_early_momentum(
-        symbol,
-        analyses,
-        btc_market,
-    )
-
-    return {
-        "status": "ANALYZED",
-        "symbol": symbol,
-        "analyses": analyses,
-        "long": long_data,
-        "short": short_data,
-        "early": early,
-        "relative_score": relative_score,
-        "relative_reason": relative_reason,
-        "derivatives": derivatives,
-    }
-
-
-# ============================================================
-# RE-EVALUATE DERIVATIVES FOR CANDIDATES
-# ============================================================
-
-def apply_derivatives_to_candidate(
-    symbol,
-    result,
-    btc_market,
-    breadth,
-):
-    try:
-        base = symbol.split("/")[0]
-
-        derivatives = get_swap_derivatives(
-            base
-        )
-
-        result["derivatives"] = derivatives
-
-        long_data = calculate_side_score(
-            result["analyses"],
-            "LONG",
-            btc_market,
-            breadth,
-            derivatives,
-            result["relative_score"],
-            result["relative_reason"],
-        )
-
-        short_data = calculate_side_score(
-            result["analyses"],
-            "SHORT",
-            btc_market,
-            breadth,
-            derivatives,
-            result["relative_score"],
-            result["relative_reason"],
-        )
-
-        result["long"] = long_data
-        result["short"] = short_data
-
-        return result
-
-    except Exception as e:
-        print(
-            f"Derivative analysis error {symbol}:",
-            e,
-        )
-
-        return result
-
-
-# ============================================================
-# FINAL SETUP FILTER
-# ============================================================
-
-def candidate_signal(
-    symbol,
-    result,
-    btc_market,
-    fg_value,
-    fg_text,
-):
-    analyses = result["analyses"]
-
-    long_data = result["long"]
-    short_data = result["short"]
-
-    candidates = []
-
-    # -----------------------------
-    # LONG
-    # -----------------------------
-
-    if (
-        long_data["score"]
-        >= MIN_CONFIRMED_SCORE
-        and not long_data["veto"]
-        and not is_overextended(
-            analyses,
-            "LONG",
-        )
-        and not is_on_cooldown(
-            symbol,
-            "LONG",
-        )
-    ):
-
-        one_h = analyses["1h"]
-
-        # Do not allow a long if 1H is clearly bearish.
-        if not (
-            one_h["bearish"]
-            >= one_h["bullish"] + 12
-        ):
-
-            signal = make_signal(
-                symbol,
-                "LONG",
-                long_data,
-                analyses,
-                btc_market,
-                fg_value,
-                fg_text,
-                result.get(
-                    "derivatives",
-                    {},
-                ),
-                result.get(
-                    "relative_reason",
-                    "",
-                ),
-            )
-
-            if signal:
-                candidates.append(
-                    signal
-                )
-
-    # -----------------------------
-    # SHORT
-    # -----------------------------
-
-    if (
-        short_data["score"]
-        >= MIN_CONFIRMED_SCORE
-        and not short_data["veto"]
-        and not is_overextended(
-            analyses,
-            "SHORT",
-        )
-        and not is_on_cooldown(
-            symbol,
-            "SHORT",
-        )
-    ):
-
-        one_h = analyses["1h"]
-
-        if not (
-            one_h["bullish"]
-            >= one_h["bearish"] + 12
-        ):
-
-            signal = make_signal(
-                symbol,
-                "SHORT",
-                short_data,
-                analyses,
-                btc_market,
-                fg_value,
-                fg_text,
-                result.get(
-                    "derivatives",
-                    {},
-                ),
-                result.get(
-                    "relative_reason",
-                    "",
-                ),
-            )
-
-            if signal:
-                candidates.append(
-                    signal
-                )
-
-    if not candidates:
-        return None
-
-    candidates.sort(
-        key=lambda x: x["score"],
-        reverse=True,
-    )
-
-    return candidates[0]
-
-
-# ============================================================
-# SCAN MARKET
-# ============================================================
-
-def scan_market(exchange):
-    global daily_confirmed_sent
-    global daily_early_sent
-
-    reset_daily_counter()
-
-    print()
-    print("=" * 60)
-    print(
-        "V3 MARKET SCAN",
-        now_utc().isoformat(),
-    )
-    print("=" * 60)
-
-    # --------------------------------
-    # BTC
-    # --------------------------------
-
-    btc_market = get_btc_market_analysis(
-        exchange
-    )
-
-    print(
-        "BTC regime:",
-        btc_market["regime"],
-        "long:",
-        btc_market.get("long_score"),
-        "short:",
-        btc_market.get("short_score"),
-    )
-
-    btc_1h_df = get_closed_candles(
-        exchange,
-        "BTC/USDT",
-        "1h",
-        80,
-    )
-
-    # --------------------------------
-    # Fear & Greed
-    # --------------------------------
-
-    fg_value, fg_text = get_fear_greed()
-
-    print(
-        "Fear & Greed:",
-        fg_value,
-        fg_text,
-    )
-
-    # --------------------------------
-    # Universe
-    # --------------------------------
-
-    coins, available_count = (
-        get_top_coins(exchange)
-    )
-
-    print(
-        "Coins available:",
-        available_count,
-    )
-
-    print(
-        "Coins selected for technical scan:",
-        len(coins),
-    )
-
-    if not coins:
-        print(
-            "No coins available."
-        )
-        return
-
-    symbols = [
-        item["symbol"]
-        for item in coins
-    ]
-
-    # --------------------------------
-    # Breadth
-    # --------------------------------
-
-    breadth = calculate_market_breadth(
-        exchange,
-        symbols,
-        max_check=30,
-    )
-
-    print(
-        "Market breadth:",
-        breadth,
-    )
-
-    # --------------------------------
-    # Scan
-    # --------------------------------
-
-    analyzed = 0
-    rejected = 0
-
-    rejection_reasons = {}
-
-    confirmed_candidates = []
-    early_candidates = []
-
-    full_results = {}
-
-    for index, item in enumerate(
-        coins,
-        start=1,
-    ):
-
-        symbol = item["symbol"]
-
-        print(
-            f"[{index}/{len(coins)}] {symbol}"
-        )
-
-        if has_active_same_coin(
-            symbol
-        ):
-            rejected += 1
-
-            rejection_reasons[
-                "Active signal"
-            ] = (
-                rejection_reasons.get(
-                    "Active signal",
-                    0,
-                )
-                + 1
-            )
-
-            continue
-
+                s["best"]=min(s["best"],lo);s["worst"]=max(s["worst"],hi)
+                if hi>=s["sl"]:out="SL"
+                elif lo<=s["tp3"]:out="TP3"
+                elif lo<=s["tp2"]:s["tp1_hit"]=s["tp2_hit"]=True
+                elif lo<=s["tp1"]:s["tp1_hit"]=True
+            if out:
+                journal("OUTCOME",{**s,"outcome":out,"closed":iso()})
+                if out=="SL":COOLDOWN[s["symbol"]+":"+s["side"]]=(now()+timedelta(hours=4)).isoformat()
+                del ACTIVE[k]
+        except:pass
+
+def can_early(sym,side,score):
+    k=sym+":"+side;p=EARLY_STATE.get(k)
+    if p:
         try:
-
-            result = analyze_coin(
-                exchange,
-                symbol,
-                btc_market,
-                btc_1h_df,
-                breadth,
-                fg_value,
-                fg_text,
-            )
-
-            if result["status"] != "ANALYZED":
-                rejected += 1
-
-                reason = result.get(
-                    "reason",
-                    "Unknown",
-                )
-
-                rejection_reasons[
-                    reason
-                ] = (
-                    rejection_reasons.get(
-                        reason,
-                        0,
-                    )
-                    + 1
-                )
-
-                continue
-
-            analyzed += 1
-
-            full_results[
-                symbol
-            ] = result
-
-            # Save strongest technical candidates for
-            # derivatives analysis.
-            long_score = result[
-                "long"
-            ]["score"]
-
-            short_score = result[
-                "short"
-            ]["score"]
-
-            best_score = max(
-                long_score,
-                short_score,
-            )
-
-            if best_score >= 62:
-
-                result = (
-                    apply_derivatives_to_candidate(
-                        symbol,
-                        result,
-                        btc_market,
-                        breadth,
-                    )
-                )
-
-                full_results[
-                    symbol
-                ] = result
-
-            signal = candidate_signal(
-                symbol,
-                result,
-                btc_market,
-                fg_value,
-                fg_text,
-            )
-
-            if signal:
-                confirmed_candidates.append(
-                    signal
-                )
-
-            early = result.get(
-                "early"
-            )
-
-            if early:
-                early_candidates.append(
-                    early
-                )
-
-        except Exception as e:
-
-            rejected += 1
-
-            reason = "Analysis exception"
-
-            rejection_reasons[
-                reason
-            ] = (
-                rejection_reasons.get(
-                    reason,
-                    0,
-                )
-                + 1
-            )
-
-            print(
-                f"{symbol} error:",
-                e,
-            )
-
-    # --------------------------------
-    # Remove duplicates
-    # --------------------------------
-
-    confirmed_candidates.sort(
-        key=lambda x: x["score"],
-        reverse=True,
-    )
-
-    early_candidates.sort(
-        key=lambda x: x["score"],
-        reverse=True,
-    )
-
-    # --------------------------------
-    # Send early radar
-    # --------------------------------
-
-    early_sent_this_scan = 0
-
-    if (
-        daily_early_sent
-        < MAX_EARLY_PER_DAY
-    ):
-
-        for alert in early_candidates:
-
-            if (
-                early_sent_this_scan
-                >= MAX_EARLY_PER_SCAN
-            ):
-                break
-
-            # Don't send early alert if the coin already
-            # has a confirmed signal candidate.
-            if any(
-                signal["symbol"]
-                == alert["symbol"]
-                for signal
-                in confirmed_candidates
-            ):
-                continue
-
-            message = format_early_alert(
-                alert
-            )
-
-            if send_telegram(
-                message
-            ):
-
-                daily_early_sent += 1
-                early_sent_this_scan += 1
-
-                journal_event(
-                    {
-                        "event":
-                            "EARLY_ALERT",
-                        "symbol":
-                            alert["symbol"],
-                        "side":
-                            alert["side"],
-                        "score":
-                            alert["score"],
-                    }
-                )
-
-    # --------------------------------
-    # Send confirmed
-    # --------------------------------
-
-    confirmed_sent_this_scan = 0
-
-    for signal in confirmed_candidates:
-
-        if (
-            confirmed_sent_this_scan
-            >= MAX_CONFIRMED_PER_SCAN
-        ):
-            break
-
-        if (
-            daily_confirmed_sent
-            >= MAX_CONFIRMED_PER_DAY
-        ):
-            break
-
-        if has_active_same_coin(
-            signal["symbol"]
-        ):
-            continue
-
-        message = format_signal(
-            signal
-        )
-
-        if send_telegram(
-            message
-        ):
-
-            remember_signal(
-                signal
-            )
-
-            daily_confirmed_sent += 1
-            confirmed_sent_this_scan += 1
-
-    # --------------------------------
-    # Diagnostics
-    # --------------------------------
-
-    print()
-    print("========== V3 AUDIT ==========")
-    print(
-        "Coins available:",
-        available_count,
-    )
-
-    print(
-        "Actually analyzed:",
-        analyzed,
-    )
-
-    print(
-        "Rejected:",
-        rejected,
-    )
-
-    print(
-        "Early opportunities:",
-        len(early_candidates),
-    )
-
-    print(
-        "Confirmed setups:",
-        len(confirmed_candidates),
-    )
-
-    print(
-        "Confirmed sent this scan:",
-        confirmed_sent_this_scan,
-    )
-
-    print(
-        "Early sent this scan:",
-        early_sent_this_scan,
-    )
-
-    print(
-        "Daily confirmed:",
-        daily_confirmed_sent,
-        "/",
-        MAX_CONFIRMED_PER_DAY,
-    )
-
-    print(
-        "Daily early:",
-        daily_early_sent,
-        "/",
-        MAX_EARLY_PER_DAY,
-    )
-
-    print(
-        "BTC regime:",
-        btc_market["regime"],
-    )
-
-    print(
-        "Breadth:",
-        breadth["status"],
-        breadth["breadth"],
-    )
-
-    if rejection_reasons:
-
-        print()
-        print(
-            "Top rejection reasons:"
-        )
-
-        sorted_rejections = sorted(
-            rejection_reasons.items(),
-            key=lambda x: x[1],
-            reverse=True,
-        )
-
-        for reason, count in (
-            sorted_rejections[:10]
-        ):
-            print(
-                f" - {reason}: {count}"
-            )
-
-    print(
-        "=============================="
-    )
-    print()
-
-
-# ============================================================
-# STARTUP
-# ============================================================
-
-def send_startup_message():
-    message = (
-        "🤖 <b>Crypto Signal Bot V3 Started</b>\n\n"
-        "🧠 Independent LONG/SHORT engine\n"
-        "📊 1D + 4H + 1H analysis\n"
-        "₿ BTC regime detection\n"
-        "🚨 Early momentum radar\n"
-        "🔄 1H reversal protection\n"
-        "📈 Volume + structure + momentum\n"
-        "💰 Funding/OI intelligence when available\n"
-        "📝 Signal journal enabled\n\n"
-        "⚠️ Demo/testing mode — no trade execution."
-    )
-
-    send_telegram(
-        message
-    )
-
-
-# ============================================================
-# MAIN LOOP
-# ============================================================
-
-def run_bot():
-
-    load_journal()
-
-    exchange = ccxt.okx(
-        {
-            "enableRateLimit": True,
-            "options": {
-                "defaultType": "spot",
-            },
-        }
-    )
-
-    print()
-    print(
-        "=========================================="
-    )
-    print(
-        "      CRYPTO SIGNAL BOT V3"
-    )
-    print(
-        "=========================================="
-    )
-
-    print(
-        "Exchange: OKX"
-    )
-
-    print(
-        "Mode: MARKET DATA / SIGNAL ONLY"
-    )
-
-    print(
-        "Scan interval:",
-        SCAN_INTERVAL,
-        "seconds",
-    )
-
-    print(
-        "Max universe:",
-        MAX_UNIVERSE,
-    )
-
-    print(
-        "=========================================="
-    )
-
-    send_startup_message()
-
+            if now()-datetime.fromisoformat(p["ts"])<timedelta(hours=2) and score<=p["score"]+3:return False
+        except:pass
+    EARLY_STATE[k]={"ts":iso(),"score":score};return True
+
+# ========================= SCAN =========================
+def scan():
+    today=now().strftime("%Y-%m-%d")
+    if DAILY["date"]!=today:DAILY.update(date=today,confirmed=0,early=0)
+    cleanup()
+    items=news();macro=macro_news(items);fgv=fng()
+    uni,total=universe()
+    b1=analyze(candles("BTC-USDT","1D",220));b4=analyze(candles("BTC-USDT","4H",220));bh=analyze(candles("BTC-USDT","1H",260))
+    if not b1 or not b4 or not bh:
+        print("BTC unavailable; no signals.");return
+    btc=btc_regime(b1,b4,bh,macro)
+    rows=[];errors={}
+    with ThreadPoolExecutor(max_workers=FETCH_WORKERS) as pool:
+        fs=[pool.submit(coin,x,bh,items,macro) for x in uni if x!="BTC-USDT"]
+        for q in as_completed(fs):
+            try:r=q.result()
+            except Exception as e:r={"ok":False,"reason":str(e)}
+            if r.get("ok"):rows.append(r)
+            else:errors[r.get("reason","error")]=errors.get(r.get("reason","error"),0)+1
+    br=breadth(rows)
+    candidates=[];radars=[]
+    for r in rows:
+        for side in ("LONG","SHORT"):
+            hard,vr=veto(side,btc,r["h1"],r["h4"],r["news"],br)
+            sc,ev,risk=score(side,r["d1"],r["h4"],r["h1"],btc,br,r["rel"],r["deriv"],r["news"],macro,fgv)
+            ex,er=extended(r["h1"],r["h4"],side)
+            ck=r["symbol"]+":"+side
+            higher=(r["d1"]["direction"]=="BULLISH" or r["h4"]["direction"]=="BULLISH") if side=="LONG" else (r["d1"]["direction"]=="BEARISH" or r["h4"]["direction"]=="BEARISH")
+            if side=="LONG":
+                oneh=r["h1"]["direction"]=="BULLISH" and r["h1"]["rsi"]>=50
+            else:
+                oneh=r["h1"]["direction"]=="BEARISH" and r["h1"]["rsi"]<=50
+            valid=sc>=67 and not hard and not ex and ck not in ACTIVE and ck not in COOLDOWN and len(risk)<=3 and higher and oneh
+            if valid:
+                sl,tp1,tp2,tp3=levels(side,r["h1"]["close"],r["h1"]["atr"])
+                candidates.append({"symbol":r["symbol"],"side":side,"score":sc,"entry":r["h1"]["close"],
+                    "sl":sl,"tp1":tp1,"tp2":tp2,"tp3":tp3,"ev":ev,"risk":risk,"d1":r["d1"],"h4":r["h4"],"h1":r["h1"],
+                    "news":r["news"],"deriv":r["deriv"],"rel":r["rel"]})
+            rr=radar(side,r["h1"],r["h4"],btc,r["news"],r["rel"])
+            if rr["status"]=="EARLY":
+                radars.append({**rr,"symbol":r["symbol"],"side":side,"price":r["h1"]["close"]})
+    candidates.sort(key=lambda x:x["score"],reverse=True);radars.sort(key=lambda x:x["score"],reverse=True)
+    used=set();sent=0
+    for c in candidates:
+        if sent>=MAX_CONFIRMED or DAILY["confirmed"]>=DAILY_CONF or c["symbol"] in used:continue
+        if c["side"]=="LONG" and btc["regime"]=="RISK_OFF":continue
+        if c["side"]=="SHORT" and btc["regime"]=="RISK_ON":continue
+        if tg(confirmed_msg(c,btc,br,macro,fgv)):
+            register(c);used.add(c["symbol"]);sent+=1;DAILY["confirmed"]+=1
+    es=0
+    for r in radars:
+        if es>=MAX_EARLY or DAILY["early"]>=DAILY_EARLY or r["symbol"] in used:continue
+        if not can_early(r["symbol"],r["side"],r["score"]):continue
+        if tg(early_msg(r)):
+            journal("EARLY",r);es+=1;DAILY["early"]+=1
+    print("\n"+"="*65)
+    print("V4 AUDIT",iso())
+    print("Coins available:",total,"Selected:",len(uni),"Analyzed:",len(rows))
+    print("BTC:",btc,"Breadth:",br,"Macro:",macro["bias"])
+    print("Early:",len(radars),"Confirmed candidates:",len(candidates),"Sent:",sent)
+    print("Daily:",DAILY)
+    if candidates:
+        print("TOP:",[(x["symbol"],x["side"],x["score"]) for x in candidates[:10]])
+    if radars:
+        print("EARLY:",[(x["symbol"],x["side"],x["score"]) for x in radars[:10]])
+    if errors:print("Errors:",sorted(errors.items(),key=lambda x:x[1],reverse=True)[:8])
+    save()
+
+def main():
+    load()
+    tg("🚀 <b>CRYPTO SIGNAL BOT V4 STARTED</b>\n"
+       "Market-first • BTC regime • macro/news • breadth • derivatives • early radar\n"
+       "🧪 Signal-only / demo testing — no order execution.")
     while True:
-
-        try:
-
-            cleanup_active_signals(
-                exchange
-            )
-
-            scan_market(
-                exchange
-            )
-
+        try:scan()
+        except KeyboardInterrupt:break
         except Exception as e:
+            print("LOOP ERROR:",e);traceback.print_exc()
+            tg("⚠️ <b>V4 runtime error</b>\n<code>"+html.escape(str(e)[:700])+"</code>")
+        print("Sleeping",SCAN_INTERVAL,"seconds...")
+        time.sleep(SCAN_INTERVAL)
 
-            print(
-                "MAIN LOOP ERROR:",
-                e,
-            )
-
-            try:
-                send_telegram(
-                    "⚠️ <b>Bot Error</b>\n"
-                    f"<code>{html.escape(str(e))}</code>\n"
-                    "Bot will retry automatically."
-                )
-            except Exception:
-                pass
-
-        print(
-            f"Sleeping {SCAN_INTERVAL} seconds..."
-        )
-
-        time.sleep(
-            SCAN_INTERVAL
-        )
-
-
-# ============================================================
-# ENTRY
-# ============================================================
-
-if __name__ == "__main__":
-    run_bot()
+if __name__=="__main__":main()
