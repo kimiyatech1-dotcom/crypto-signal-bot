@@ -373,12 +373,17 @@ def veto(side,btc,a,b,n,br):
 
 def score(side,d1,h4,h1,btc,br,rel,d,n,macro,fg):
     sc=50;ev=[];risk=[]
+    # Keep timeframe contributions bounded; prevents score saturation at 100.
     for tf,w,name in ((d1,.20,"1D"),(h4,.30,"4H"),(h1,.35,"1H")):
         raw=tf["bull"]-tf["bear"]
-        if side=="SHORT":raw=-raw
-        sc+=w*raw/12*100
-        if (side=="LONG" and tf["direction"]=="BULLISH") or (side=="SHORT" and tf["direction"]=="BEARISH"):ev.append(name+" aligned")
-        else:risk.append(name+" conflict")
+        if side=="SHORT":
+            raw=-raw
+        tf_score=clamp(raw/12.0,-1.0,1.0)
+        sc += w*30*tf_score
+        if (side=="LONG" and tf["direction"]=="BULLISH") or (side=="SHORT" and tf["direction"]=="BEARISH"):
+            ev.append(name+" aligned")
+        else:
+            risk.append(name+" conflict")
     if side=="LONG":
         if btc["regime"] in ("RISK_ON","RECOVERY"):sc+=14;ev.append("BTC supportive")
         elif btc["regime"] in ("RISK_OFF","DISTRIBUTION"):sc-=18;risk.append("BTC adverse")
@@ -539,12 +544,16 @@ def scan():
             sc,ev,risk=score(side,r["d1"],r["h4"],r["h1"],btc,br,r["rel"],r["deriv"],r["news"],macro,fgv)
             ex,er=extended(r["h1"],r["h4"],side)
             ck=r["symbol"]+":"+side
-            higher=(r["d1"]["direction"]=="BULLISH" or r["h4"]["direction"]=="BULLISH") if side=="LONG" else (r["d1"]["direction"]=="BEARISH" or r["h4"]["direction"]=="BEARISH")
+            # Confirmed setups require 4H alignment.
+            # A strongly opposite 1D trend is also a veto.
+            h4_aligned=(r["h4"]["direction"]=="BULLISH") if side=="LONG" else (r["h4"]["direction"]=="BEARISH")
+            d1_conflict=(r["d1"]["direction"]=="BEARISH" and r["d1"]["gap"]<=-6) if side=="LONG" else (r["d1"]["direction"]=="BULLISH" and r["d1"]["gap"]>=6)
             if side=="LONG":
                 oneh=r["h1"]["direction"]=="BULLISH" and r["h1"]["rsi"]>=50
             else:
                 oneh=r["h1"]["direction"]=="BEARISH" and r["h1"]["rsi"]<=50
-            valid=sc>=67 and not hard and not ex and ck not in ACTIVE and ck not in COOLDOWN and len(risk)<=3 and higher and oneh
+            valid=(sc>=67 and not hard and not ex and ck not in ACTIVE and ck not in COOLDOWN
+                   and len(risk)<=2 and h4_aligned and not d1_conflict and oneh)
             if valid:
                 sl,tp1,tp2,tp3=levels(side,r["h1"]["close"],r["h1"]["atr"])
                 candidates.append({"symbol":r["symbol"],"side":side,"score":sc,"entry":r["h1"]["close"],
