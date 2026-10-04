@@ -385,6 +385,21 @@ def score(side,d1,h4,h1,btc,br,rel,d,n,macro,fg):
         if (side=="LONG" and tf["direction"]=="BULLISH") or (side=="SHORT" and tf["direction"]=="BEARISH"):
             ev.append(name+" aligned")
         else:
+            risk.append(name+" conflict")
+    if side=="LONG":
+        if btc["regime"] in ("RISK_ON","RECOVERY"):sc+=14;ev.append("BTC supportive")
+        elif btc["regime"] in ("RISK_OFF","DISTRIBUTION"):sc-=18;risk.append("BTC adverse")
+        if br["status"]=="BULLISH":sc+=8
+        elif br["status"]=="BEARISH":sc-=8
+        if rel is not None:sc+=clamp(rel,-8,8);ev+=["relative strength"] if rel>2 else []
+        if d["funding"] is not None:
+            if d["funding"]<-.0001:sc+=4;ev.append("negative funding")
+            elif d["funding"]>.0005:sc-=5;risk.append("crowded funding")
+        if n["bias"]=="POSITIVE":sc+=10;ev.append("positive catalyst")
+        elif n["bias"]=="NEGATIVE":sc-=10;risk.append("negative catalyst")
+    else:
+        if btc["regime"] in ("RISK_OFF","DISTRIBUTION"):sc+=14;ev.append("BTC supportive")
+        elif btc["regime"] in ("RISK_ON","RECOVERY"):sc-=18;risk.append("BTC adverse")
         if br["status"]=="BEARISH":sc+=8
         elif br["status"]=="BULLISH":sc-=8
         if rel is not None:sc+=clamp(-rel,-8,8);ev+=["relative weakness"] if rel<-2 else []
