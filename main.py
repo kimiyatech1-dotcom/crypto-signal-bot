@@ -550,10 +550,14 @@ def scan():
             d1_conflict=(r["d1"]["direction"]=="BEARISH" and r["d1"]["gap"]<=-6) if side=="LONG" else (r["d1"]["direction"]=="BULLISH" and r["d1"]["gap"]>=6)
             if side=="LONG":
                 oneh=r["h1"]["direction"]=="BULLISH" and r["h1"]["rsi"]>=50
+                m15=r["m15"]["direction"]=="BULLISH" and r["m15"]["rsi"]>=48
             else:
                 oneh=r["h1"]["direction"]=="BEARISH" and r["h1"]["rsi"]<=50
+                m15=r["m15"]["direction"]=="BEARISH" and r["m15"]["rsi"]<=52
+
+            # 15m is the entry-timing layer, not a replacement for 1H/4H/1D.
             valid=(sc>=67 and not hard and not ex and ck not in ACTIVE and ck not in COOLDOWN
-                   and len(risk)<=2 and h4_aligned and not d1_conflict and oneh)
+                   and len(risk)<=2 and h4_aligned and not d1_conflict and oneh and m15)
             if valid:
                 sl,tp1,tp2,tp3=levels(side,r["h1"]["close"],r["h1"]["atr"])
                 candidates.append({"symbol":r["symbol"],"side":side,"score":sc,"entry":r["h1"]["close"],
