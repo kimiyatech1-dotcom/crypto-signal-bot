@@ -4,8 +4,8 @@ from datetime import datetime, timezone, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import requests, pandas as pd
 
-# ========================= V4 CONFIG =========================
-APP="CRYPTO SIGNAL BOT V4"
+# ========================= V5 CONFIG =========================
+APP="CRYPTO SIGNAL BOT V5"
 BASE=os.getenv("OKX_BASE_URL","https://www.okx.com").rstrip("/")
 TOKEN=os.getenv("TELEGRAM_TOKEN","").strip()
 CHAT_ID=os.getenv("CHAT_ID","").strip()
@@ -14,16 +14,24 @@ MAX_UNIVERSE=int(os.getenv("MAX_UNIVERSE","80"))
 FETCH_WORKERS=int(os.getenv("FETCH_WORKERS","4"))
 MAX_CONFIRMED=int(os.getenv("MAX_CONFIRMED_PER_SCAN","3"))
 MAX_EARLY=int(os.getenv("MAX_EARLY_PER_SCAN","5"))
+MAX_ACTIVE=int(os.getenv("MAX_ACTIVE_SIGNALS","6"))       # ek waqt mein kul open signals
+MAX_PER_SIDE=int(os.getenv("MAX_PER_SIDE_PER_SCAN","2"))   # ek scan mein max LONG / max SHORT
+MIN_SCORE=int(os.getenv("MIN_SCORE","72"))                 # confirmed signal ka minimum score
+EXPIRY_HOURS=float(os.getenv("SIGNAL_EXPIRY_HOURS","48"))  # itne ghante baad purana signal band
+NOTIFY_OUTCOMES=os.getenv("NOTIFY_OUTCOMES","true").lower() in ("1","true","yes","on")
 DAILY_CONF=int(os.getenv("DAILY_CONFIRMED_LIMIT","5"))
 DAILY_EARLY=int(os.getenv("DAILY_EARLY_LIMIT","8"))
 NEWS_HOURS=float(os.getenv("NEWS_LOOKBACK_HOURS","12"))
 ENABLE_NEWS=os.getenv("ENABLE_NEWS","true").lower() in ("1","true","yes","on")
-STATE_FILE=os.getenv("STATE_FILE","v4_state.json")
-JOURNAL_FILE=os.getenv("JOURNAL_FILE","v4_journal.jsonl")
+DATA_DIR=os.getenv("DATA_DIR",".")   # Railway Volume lagayein to DATA_DIR=/data set karein
+try: os.makedirs(DATA_DIR,exist_ok=True)
+except Exception: pass
+STATE_FILE=os.getenv("STATE_FILE",os.path.join(DATA_DIR,"v4_state.json"))
+JOURNAL_FILE=os.getenv("JOURNAL_FILE",os.path.join(DATA_DIR,"v4_journal.jsonl"))
 STABLE={"USDT","USDC","USDE","DAI","FDUSD","TUSD","USDD","USDG","PYUSD","EURC"}
 LEV=re.compile(r"(^|[-_])(2L|2S|3L|3S|5L|5S)([-_]|$)",re.I)
 S=requests.Session()
-S.headers.update({"User-Agent":"CryptoSignalBotV4/4.0","Accept":"application/json,text/xml,*/*"})
+S.headers.update({"User-Agent":"CryptoSignalBotV5/4.0","Accept":"application/json,text/xml,*/*"})
 LOCK=threading.Lock()
 ACTIVE={}
 COOLDOWN={}
@@ -413,6 +421,8 @@ def score(side,d1,h4,h1,btc,br,rel,d,n,macro,fg):
     if fg:
         if side=="LONG" and fg[0]>80:sc-=3
         if side=="SHORT" and fg[0]<20:sc-=3
+    # V5: raw score ko compress karte hain taake sab coins 100 par na pahunchein
+    sc=50+(sc-50)*0.65
     return int(clamp(round(sc),0,100)),ev,risk
 
 # ========================= EARLY RADAR =========================
@@ -461,7 +471,7 @@ def levels(side,p,at):
 
 def confirmed_msg(c,btc,br,macro,fg):
     d=c["deriv"];n=c["news"];i="🟢" if c["side"]=="LONG" else "🔴"
-    z=[f"{i} <b>{c['side']} CONFIRMED — V4</b>","━━━━━━━━━━━━━━",
+    z=[f"{i} <b>{c['side']} CONFIRMED — V5</b>","━━━━━━━━━━━━━━",
        f"<b>Coin:</b> {html.escape(c['symbol'])}",f"<b>Model Score:</b> {c['score']}/100",
        f"<b>Entry:</b> {price(c['entry'])}",f"<b>SL:</b> {price(c['sl'])}",
        f"<b>TP1:</b> {price(c['tp1'])}",f"<b>TP2:</b> {price(c['tp2'])}",f"<b>TP3:</b> {price(c['tp3'])}",
@@ -488,34 +498,79 @@ def register(c):
     k=c["symbol"]+":"+c["side"]
     ACTIVE[k]={"symbol":c["symbol"],"side":c["side"],"entry":c["entry"],"sl":c["sl"],
                "tp1":c["tp1"],"tp2":c["tp2"],"tp3":c["tp3"],"created":iso(),
-               "best":c["entry"],"worst":c["entry"],"tp1_hit":False,"tp2_hit":False,"tp3_hit":False}
+               "best":c["entry"],"worst":c["entry"],"tp1_hit":False,"tp2_hit":False,"tp3_hit":False,"m15":c["m15"]["direction"]}
     # FIX: journal mein DataFrame wali heavy fields nahi jaati
     journal("SIGNAL",{x:c[x] for x in ("symbol","side","score","entry","sl","tp1","tp2","tp3","ev","risk")})
 
+def notify_outcome(s,text):
+    if not NOTIFY_OUTCOMES:return
+    tg(f"{text}\n<b>{html.escape(s['symbol'])}</b> {s['side']} | Entry: {price(s['entry'])}")
+
 def cleanup():
+    """Har active signal ko signal ke baad ki saari 15m candles par check karta hai.
+    Ek hi candle mein SL aur TP dono lagein to conservative taur par SL maana jata hai."""
     for k in list(ACTIVE):
         s=ACTIVE[k]
         try:
-            df=candles(s["symbol"].replace("/","-"),"1H",5)
-            x=df.iloc[-1];hi=float(x.high);lo=float(x.low)
+            created=datetime.fromisoformat(s["created"])
+            age_h=(now()-created).total_seconds()/3600
+            df=candles(s["symbol"].replace("/","-"),"15m",150)
             out=None
-            if s["side"]=="LONG":
-                s["best"]=max(s["best"],hi);s["worst"]=min(s["worst"],lo)
-                if lo<=s["sl"]:out="SL"
-                elif hi>=s["tp3"]:out="TP3"
-                elif hi>=s["tp2"]:s["tp1_hit"]=s["tp2_hit"]=True
-                elif hi>=s["tp1"]:s["tp1_hit"]=True
-            else:
-                s["best"]=min(s["best"],lo);s["worst"]=max(s["worst"],hi)
-                if hi>=s["sl"]:out="SL"
-                elif lo<=s["tp3"]:out="TP3"
-                elif lo<=s["tp2"]:s["tp1_hit"]=s["tp2_hit"]=True
-                elif lo<=s["tp1"]:s["tp1_hit"]=True
+            if not df.empty:
+                df=df[df["ts"]>=pd.Timestamp(created).floor("15min")]
+                for _,x in df.iterrows():
+                    hi=float(x.high);lo=float(x.low)
+                    if s["side"]=="LONG":
+                        s["best"]=max(s["best"],hi);s["worst"]=min(s["worst"],lo)
+                        if lo<=s["sl"]:out="SL";break
+                        hits=[hi>=s["tp1"],hi>=s["tp2"],hi>=s["tp3"]]
+                    else:
+                        s["best"]=min(s["best"],lo);s["worst"]=max(s["worst"],hi)
+                        if hi>=s["sl"]:out="SL";break
+                        hits=[lo<=s["tp1"],lo<=s["tp2"],lo<=s["tp3"]]
+                    for i,h in enumerate(hits,1):
+                        if h and not s.get(f"tp{i}_hit"):
+                            s[f"tp{i}_hit"]=True
+                            notify_outcome(s,f"✅ <b>TP{i} HIT</b>")
+                    if s.get("tp3_hit"):out="TP3";break
+            if not out and age_h>=EXPIRY_HOURS:out="EXPIRED"
             if out:
-                journal("OUTCOME",{**s,"outcome":out,"closed":iso()})
-                if out=="SL":COOLDOWN[s["symbol"]+":"+s["side"]]=(now()+timedelta(hours=4)).isoformat()
+                reached=sum(1 for i in (1,2,3) if s.get(f"tp{i}_hit"))
+                journal("OUTCOME",{**s,"outcome":out,"reached":reached,"closed":iso()})
+                if out=="SL":
+                    COOLDOWN[s["symbol"]+":"+s["side"]]=(now()+timedelta(hours=4)).isoformat()
+                    notify_outcome(s,"❌ <b>SL HIT</b>"+(f" (TP{reached} pehle lag chuka tha)" if reached else ""))
+                elif out=="EXPIRED":
+                    notify_outcome(s,"⌛ <b>EXPIRED</b> (SL/TP nahi laga)")
                 del ACTIVE[k]
-        except:pass
+        except Exception as e:
+            print("cleanup",k,e)
+
+def stats():
+    """Journal se nateeje: kitne signals band hue aur kitne TP1/TP2/TP3/SL par."""
+    n=sl=exp=0;r1=r2=r3=0
+    try:
+        for line in open(JOURNAL_FILE,encoding="utf8"):
+            try:z=json.loads(line)
+            except Exception:continue
+            if z.get("event")!="OUTCOME":continue
+            o=z.get("outcome");n+=1
+            rc=sum(1 for i in (1,2,3) if z.get(f"tp{i}_hit"))
+            if o=="TP3":rc=3
+            if o=="SL":sl+=1
+            if o=="EXPIRED":exp+=1
+            if rc>=1:r1+=1
+            if rc>=2:r2+=1
+            if rc>=3:r3+=1
+    except Exception:pass
+    if not n:
+        return {"n":0},"Abhi koi signal band nahi hua (data jama ho raha hai)."
+    p1=r1/n*100
+    ev=(r1/n)*1.35-(1-r1/n)   # sirf TP1 par poora exit lene ka andaza (R mein)
+    txt=(f"Band hue signals: {n}\nTP1+ : {r1} ({p1:.0f}%) | TP2+ : {r2} | TP3 : {r3}\n"
+         f"SL: {sl} | Expired: {exp}\n"
+         f"Agar sab TP1 par nikalte: {ev:+.2f}R har trade (break-even ke liye TP1 rate ~43% chahiye)")
+    return {"n":n,"tp1":r1,"sl":sl},txt
 
 def can_early(sym,side,score):
     k=sym+":"+side;p=EARLY_STATE.get(k)
@@ -538,7 +593,10 @@ def in_cooldown(key):
 # ========================= SCAN =========================
 def scan():
     today=now().strftime("%Y-%m-%d")
-    if DAILY["date"]!=today:DAILY.update(date=today,confirmed=0,early=0)
+    if DAILY["date"]!=today:
+        if DAILY["date"]:
+            tg("📊 <b>Daily summary</b>\n"+stats()[1])
+        DAILY.update(date=today,confirmed=0,early=0)
     cleanup()
     items=news();macro=macro_news(items);fgv=fng()
     uni,total=universe()
@@ -555,15 +613,13 @@ def scan():
             if r.get("ok"):rows.append(r)
             else:errors[r.get("reason","error")]=errors.get(r.get("reason","error"),0)+1
     br=breadth(rows)
-    candidates=[];radars=[]
+    candidates=[];radars=[];why_not={}
     for r in rows:
         for side in ("LONG","SHORT"):
             hard,vr=veto(side,btc,r["h1"],r["h4"],r["news"],br)
             sc,ev,risk=score(side,r["d1"],r["h4"],r["h1"],btc,br,r["rel"],r["deriv"],r["news"],macro,fgv)
             ex,er=extended(r["h1"],r["h4"],side)
             ck=r["symbol"]+":"+side
-            # Confirmed setups require 4H alignment.
-            # A strongly opposite 1D trend is also a veto.
             h4_aligned=(r["h4"]["direction"]=="BULLISH") if side=="LONG" else (r["h4"]["direction"]=="BEARISH")
             d1_conflict=(r["d1"]["direction"]=="BEARISH" and r["d1"]["gap"]<=-6) if side=="LONG" else (r["d1"]["direction"]=="BULLISH" and r["d1"]["gap"]>=6)
             m15d=r.get("m15")
@@ -573,26 +629,43 @@ def scan():
             else:
                 oneh=r["h1"]["direction"]=="BEARISH" and r["h1"]["rsi"]<=50
                 m15=bool(m15d) and m15d["direction"]=="BEARISH" and m15d["rsi"]<=52
-
-            # 15m is the entry-timing layer, not a replacement for 1H/4H/1D.
-            valid=(sc>=67 and not hard and not ex and ck not in ACTIVE and not in_cooldown(ck)
-                   and len(risk)<=2 and h4_aligned and not d1_conflict and oneh and m15)
-            if valid:
-                sl,tp1,tp2,tp3=levels(side,r["h1"]["close"],r["h1"]["atr"])
-                candidates.append({"symbol":r["symbol"],"side":side,"score":sc,"entry":r["h1"]["close"],
+            # reject hone ki wajah gino (audit mein dikhegi)
+            fails=[]
+            if sc<MIN_SCORE:fails.append("score<min")
+            if hard:fails.append("hard veto")
+            if ex:fails.append("extended")
+            if ck in ACTIVE:fails.append("already active")
+            if in_cooldown(ck):fails.append("cooldown")
+            if len(risk)>2:fails.append("risk>2")
+            if not h4_aligned:fails.append("4H not aligned")
+            if d1_conflict:fails.append("1D conflict")
+            if not oneh:fails.append("1H not aligned")
+            if not m15:fails.append("15m not aligned")
+            for x in fails:why_not[x]=why_not.get(x,0)+1
+            if not fails:
+                # V5: entry ab latest 15m close hai (pehle 1H close tha, jo purana ho sakta tha)
+                entry=r["m15"]["close"]
+                sl,tp1,tp2,tp3=levels(side,entry,r["h1"]["atr"])
+                candidates.append({"symbol":r["symbol"],"side":side,"score":sc,"entry":entry,
                     "sl":sl,"tp1":tp1,"tp2":tp2,"tp3":tp3,"ev":ev,"risk":risk,"d1":r["d1"],"h4":r["h4"],"h1":r["h1"],
-                    "m15":r["m15"],"news":r["news"],"deriv":r["deriv"],"rel":r["rel"]})
+                    "m15":r["m15"],"news":r["news"],"deriv":r["deriv"],"rel":r["rel"],"adx":r["h1"]["adx"] or 0})
             rr=radar(side,r["h1"],r["h4"],btc,r["news"],r["rel"])
             if rr["status"]=="EARLY":
                 radars.append({**rr,"symbol":r["symbol"],"side":side,"price":r["h1"]["close"]})
-    candidates.sort(key=lambda x:x["score"],reverse=True);radars.sort(key=lambda x:x["score"],reverse=True)
-    used=set();sent=0
+    # ranking: score, phir BTC se relative strength, phir trend strength (ADX)
+    def rank(x):
+        rl=x["rel"] if x["rel"] is not None else 0
+        return (x["score"], rl if x["side"]=="LONG" else -rl, x["adx"])
+    candidates.sort(key=rank,reverse=True);radars.sort(key=lambda x:x["score"],reverse=True)
+    used=set();sent=0;per={"LONG":0,"SHORT":0}
     for c in candidates:
         if sent>=MAX_CONFIRMED or DAILY["confirmed"]>=DAILY_CONF or c["symbol"] in used:continue
+        if len(ACTIVE)>=MAX_ACTIVE:break
+        if per[c["side"]]>=MAX_PER_SIDE:continue
         if c["side"]=="LONG" and btc["regime"]=="RISK_OFF":continue
         if c["side"]=="SHORT" and btc["regime"]=="RISK_ON":continue
         if tg(confirmed_msg(c,btc,br,macro,fgv)):
-            register(c);used.add(c["symbol"]);sent+=1;DAILY["confirmed"]+=1
+            register(c);used.add(c["symbol"]);sent+=1;per[c["side"]]+=1;DAILY["confirmed"]+=1
     es=0
     for r in radars:
         if es>=MAX_EARLY or DAILY["early"]>=DAILY_EARLY or r["symbol"] in used:continue
@@ -600,29 +673,32 @@ def scan():
         if tg(early_msg(r)):
             journal("EARLY",r);es+=1;DAILY["early"]+=1
     print("\n"+"="*65)
-    print("V4 AUDIT",iso())
+    print("V5 AUDIT",iso())
     print("Coins available:",total,"Selected:",len(uni),"Analyzed:",len(rows))
     print("BTC:",btc,"Breadth:",br,"Macro:",macro["bias"])
-    print("Early:",len(radars),"Confirmed candidates:",len(candidates),"Sent:",sent)
+    print("Early:",len(radars),"Confirmed candidates:",len(candidates),"Sent:",sent,"Active:",len(ACTIVE),"/",MAX_ACTIVE)
     print("Daily:",DAILY)
+    if why_not:print("Rejected because:",sorted(why_not.items(),key=lambda x:x[1],reverse=True)[:8])
     if candidates:
         print("TOP:",[(x["symbol"],x["side"],x["score"]) for x in candidates[:10]])
     if radars:
         print("EARLY:",[(x["symbol"],x["side"],x["score"]) for x in radars[:10]])
     if errors:print("Errors:",sorted(errors.items(),key=lambda x:x[1],reverse=True)[:8])
+    print("RESULTS:",stats()[1].replace("\n"," | "))
     save()
 
 def main():
     load()
-    tg("🚀 <b>CRYPTO SIGNAL BOT V4 STARTED</b>\n"
+    tg("🚀 <b>CRYPTO SIGNAL BOT V5 STARTED</b>\n"
        "Market-first • BTC regime • macro/news • breadth • derivatives • early radar\n"
+       f"Min score {MIN_SCORE} • max {MAX_PER_SIDE}/side per scan • max {MAX_ACTIVE} active\n"
        "🧪 Signal-only / demo testing — no order execution.")
     while True:
         try:scan()
         except KeyboardInterrupt:break
         except Exception as e:
             print("LOOP ERROR:",repr(e));traceback.print_exc()
-            tg("⚠️ <b>V4 runtime error</b>\n<code>"+html.escape(repr(e)[:700])+"</code>")
+            tg("⚠️ <b>V5 runtime error</b>\n<code>"+html.escape(repr(e)[:700])+"</code>")
         print("Sleeping",SCAN_INTERVAL,"seconds...")
         time.sleep(SCAN_INTERVAL)
 
